@@ -586,7 +586,6 @@ async function ensureScreenshotsDir() {
                         blockMessage = 'Incorrect password or no account';
                         const photoDir = await ensureScreenshotsDir();
                         await page.screenshot({ path: path.join(photoDir, `login_failed_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                        await sendTelegramMessage(`❌ KataBump 登录失败: ${user.username} - 账号或密码错误`);
                         continue;
                     }
                 } catch (e) { }
@@ -696,7 +695,6 @@ async function ensureScreenshotsDir() {
                                 renewSuccess = false;
                                 const photoDir = await ensureScreenshotsDir();
                                 await dumpDebugSnapshot(page, `captcha_required_${attempt}`);
-                                await sendTelegramMessage(`⚠️ KataBump ALTCHA 验证码未完成\n用户: ${user.username}\n已尝试自动点击，但 checkbox 未变为勾选状态。`);
                                 break;
                             }
                             console.log('[ALTCHA] ✅ Checkbox 已勾选，可以点击 confirm。');
@@ -707,7 +705,6 @@ async function ensureScreenshotsDir() {
                             renewSuccess = false;
                             const photoDir = await ensureScreenshotsDir();
                             await dumpDebugSnapshot(page, `captcha_required_${attempt}`);
-                            await sendTelegramMessage(`⚠️ KataBump ALTCHA 验证码未完成\n用户: ${user.username}\n无法自动点击 ALTCHA checkbox。`);
                             break;
                         }
                     } else {
@@ -748,7 +745,6 @@ async function ensureScreenshotsDir() {
                     renewSuccess = false;
                     const photoDir = await ensureScreenshotsDir();
                     await dumpDebugSnapshot(page, `not_ready_after_${attempt}`);
-                    await sendTelegramMessage(`⏳ KataBump 还没到续期窗口\n用户: ${user.username}\n提示: ${typeof notReadyAfter === 'string' ? notReadyAfter : notReadyAfter.raw}`);
                     break;
                 }
 
@@ -787,7 +783,6 @@ async function ensureScreenshotsDir() {
                             blockMessage = stillBlocked;
                             renewSuccess = false;
                             await dumpDebugSnapshot(page, `captcha_required_${attempt}`);
-                            await sendTelegramMessage(`⚠️ KataBump 验证码未完成\n用户: ${user.username}\n状态: ${stillBlocked}\n已尝试自动点击 checkbox，但验证仍未通过。`);
                             break;
                         }
 
@@ -807,7 +802,6 @@ async function ensureScreenshotsDir() {
                                 runStatus = 'success';
                                 renewSuccess = true;
                                 await page.screenshot({ path: path.join(await ensureScreenshotsDir(), `renew_success_${attempt}.png`), fullPage: true });
-                                await sendTelegramMessage(`✅ KataBump 续期成功!\n用户: ${user.username}\n旧 Expiry: ${oldExpiry || 'N/A'}`);
                                 break;
                             }
 
@@ -822,7 +816,6 @@ async function ensureScreenshotsDir() {
                                     runStatus = 'success';
                                     renewSuccess = true;
                                     await page.screenshot({ path: path.join(await ensureScreenshotsDir(), `renew_success_${attempt}.png`), fullPage: true });
-                                    await sendTelegramMessage(`✅ KataBump 续期成功!\n用户: ${user.username}\n旧 Expiry: ${oldExpiry}\n新 Expiry: ${newExpiryFinal}`);
                                     break;
                                 }
                                 console.log('   >> Modal 已关闭，Expiry 未变，可能已是最新的。');
@@ -842,7 +835,6 @@ async function ensureScreenshotsDir() {
                         renewSuccess = false;
                         const photoDir = await ensureScreenshotsDir();
                         await dumpDebugSnapshot(page, `captcha_required_${attempt}`);
-                        await sendTelegramMessage(`⚠️ KataBump 验证码未完成\n用户: ${user.username}\n状态: ${captchaIssue}\n无法自动完成验证码。`);
                         break;
                     }
                 }
@@ -855,7 +847,6 @@ async function ensureScreenshotsDir() {
                     renewSuccess = true;
                     const photoDir = await ensureScreenshotsDir();
                     await page.screenshot({ path: path.join(photoDir, `renew_success_${attempt}.png`), fullPage: true });
-                    await sendTelegramMessage(`✅ KataBump 续期成功!\n用户: ${user.username}\n旧 Expiry: ${oldExpiry || 'N/A'}`);
                     break;
                 }
 
@@ -873,7 +864,6 @@ async function ensureScreenshotsDir() {
                         runStatus = 'success';
                         const photoDir = await ensureScreenshotsDir();
                         await page.screenshot({ path: path.join(photoDir, `renew_success_${attempt}.png`), fullPage: true });
-                        await sendTelegramMessage(`✅ KataBump 续期成功!\n用户: ${user.username}\n旧 Expiry: ${oldExpiry}\n新 Expiry: ${newExpiry}`);
                         break;
                     } else if (newExpiry === oldExpiry && newExpiry !== null) {
                         console.log('   >> ⚠️ Modal 已关闭但 Expiry 未变，可能已是最新的。');
