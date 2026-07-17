@@ -209,6 +209,13 @@ async function attemptTurnstileCdp(page) {
                 const clickY = box.y + (box.height * data.yRatio);
                 console.log(`>> 计算点击坐标: (${clickX.toFixed(2)}, ${clickY.toFixed(2)})`);
                 const client = await page.context().newCDPSession(page);
+                // 先 move 再 press/release，更接近真实鼠标
+                await client.send('Input.dispatchMouseEvent', {
+                    type: 'mouseMoved',
+                    x: clickX,
+                    y: clickY
+                });
+                await new Promise(r => setTimeout(r, 80 + Math.random() * 120));
                 await client.send('Input.dispatchMouseEvent', {
                     type: 'mousePressed',
                     x: clickX,
@@ -233,7 +240,124 @@ async function attemptTurnstileCdp(page) {
     return false;
 }
 
-// --- 通用过盾循环（保留原逻辑） ---
+// --- Playwright 鼠标真实点击 Turnstile（备用策略） ---
+async function attemptTurnstilePlaywrightMouse(page) {
+    const frames = page.frames();
+    for (const frame of frames) {
+        try {
+            const data = await frame.evaluate(() => window.__turnstile_data).catch(() => null);
+            if (!data) continue;
+            const iframeElement = await frame.frameElement();
+            if (!iframeElement) continue;
+            const box = await iframeElement.boundingBox();
+            if (!box || box.width <= 0 || box.height <= 0) continue;
+
+            // 多点尝试：注入比例点 + checkbox 左侧常见区域
+            const candidates = [
+                { x: box.x + box.width * data.xRatio, y: box.y + box.height * data.yRatio, label: 'ratio' },
+                { x: box.x + 28, y: box.y + box.height / 2, label: 'left-checkbox' },
+                { x: box.x + 35, y: box.y + box.height * 0.5, label: 'left-35' },
+                { x: box.x + box.width * 0.12, y: box.y + box.height * 0.5, label: '12%' }
+            ];
+
+            for (const pt of candidates) {
+                console.log(`>> Playwright mouse 点击策略=${pt.label} 坐标=(${pt.x.toFixed(1)}, ${pt.y.toFixed(1)})`);
+                await page.mouse.move(pt.x - 40, pt.y - 20, { steps: 8 });
+                await page.waitForTimeout(100 + Math.random() * 150);
+                await page.mouse.move(pt.x, pt.y, { steps: 6 });
+                await page.waitForTimeout(80 + Math.random() * 120);
+                await page.mouse.down();
+                await page.waitForTimeout(40 + Math.random() * 80);
+                await page.mouse.up();
+                await page.waitForTimeout(500);
+            }
+            return true;
+        } catch (e) { }
+    }
+    return false;
+}
+
+// --- 直接点击 Turnstile iframe 元素（备用） ---
+async function attemptTurnstileIframeClick(page) {
+    try {
+        const iframes = page.locator('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[title*="Widget"], iframe[title*="cloudflare"]');
+        const count = await iframes.count();
+        console.log(`>> 找到可能的 Turnstile iframe 数量: ${count}`);
+        for (let i = 0; i < count; i++) {
+            const iframe = iframes.nth(i);
+            try {
+                if (!(await iframe.isVisible({ timeout: 1000 }).catch(() => false))) continue;
+                const box = await iframe.boundingBox();
+                if (!box) continue;
+                // 点击 iframe 左侧 checkbox 区域
+                const x = box.x + 30;
+                const y = box.y + box.height / 2;
+                console.log(`>> iframe.click 坐标=(${x.toFixed(1)}, ${y.toFixed(1)})`);
+                await page.mouse.move(x, y, { steps: 5 });
+                await page.waitForTimeout(100);
+                await page.mouse.click(x, y);
+                return true;
+            } catch (e) { }
+        }
+    } catch (e) { }
+    return false;
+}
+
+// --- 读取 token 状态（主文档 + 诊断） ---
+async function getTurnstileTokenInfo(page) {
+    return await page.evaluate(() => {
+        const selectors = [
+            'input[name="cf-turnstile-response"]',
+            'textarea[name="cf-turnstile-response"]',
+            'input[name="g-recaptcha-response"]',
+            'textarea[name="g-recaptcha-response"]',
+            '[name="cf-turnstile-response"]',
+            '[name="g-recaptcha-response"]'
+        ];
+
+        const found = [];
+        for (const selector of selectors) {
+            document.querySelectorAll(selector).forEach((el) => {
+                const value = (el.value || el.getAttribute('value') || '').trim();
+                found.push({
+                    selector,
+                    tag: el.tagName,
+                    name: el.getAttribute('name') || '',
+                    length: value.length,
+                    hasValue: value.length > 0
+                });
+            });
+        }
+
+        // 任意 data-sitekey / turnstile 容器
+        const widgets = document.querySelectorAll('[data-sitekey], .cf-turnstile, #cf-turnstile, [class*="turnstile"]');
+        const widgetInfo = Array.from(widgets).map((el) => ({
+            tag: el.tagName,
+            className: el.className,
+            sitekey: el.getAttribute('data-sitekey') || '',
+            hasShadow: !!el.shadowRoot
+        }));
+
+        const iframes = Array.from(document.querySelectorAll('iframe')).map((el) => ({
+            src: (el.src || '').substring(0, 120),
+            title: el.title || '',
+            w: el.offsetWidth,
+            h: el.offsetHeight
+        }));
+
+        const tokenHit = found.find((f) => f.hasValue);
+        return {
+            found: !!tokenHit,
+            selector: tokenHit ? tokenHit.selector : null,
+            length: tokenHit ? tokenHit.length : 0,
+            fields: found,
+            widgets: widgetInfo,
+            iframes
+        };
+    }).catch(() => ({ found: false, selector: null, length: 0, fields: [], widgets: [], iframes: [] }));
+}
+
+// --- 通用过盾循环（保留原逻辑，供 Renew 等阶段使用） ---
 async function solveTurnstileIfPresent(page, stageName = "通用", maxAttempts = 10, waitAfterClick = 5000) {
     console.log(`[${stageName}] 开始检测 Cloudflare Turnstile...`);
     for (let i = 0; i < maxAttempts; i++) {
@@ -249,39 +373,85 @@ async function solveTurnstileIfPresent(page, stageName = "通用", maxAttempts =
     return false;
 }
 
+// --- 登录专用：多策略点击 + 等 token，token 为空则换策略重试 ---
+async function solveLoginTurnstile(page, totalTimeoutMs = 60000) {
+    const startedAt = Date.now();
+    console.log(`[登录阶段] 开始解决 Turnstile（多策略，最长 ${totalTimeoutMs}ms）...`);
+
+    // 先等 iframe / widget 出现
+    for (let i = 0; i < 15; i++) {
+        const info = await getTurnstileTokenInfo(page);
+        if (info.found) {
+            console.log(`[登录阶段] Turnstile token 已存在，字段=${info.selector}，长度=${info.length}`);
+            return true;
+        }
+        if (info.iframes.some(f => /turnstile|cloudflare|challenges/i.test(f.src + f.title))) break;
+        // 也可能有 __turnstile_data
+        let hasData = false;
+        for (const frame of page.frames()) {
+            const data = await frame.evaluate(() => window.__turnstile_data).catch(() => null);
+            if (data) { hasData = true; break; }
+        }
+        if (hasData) break;
+        await page.waitForTimeout(1000);
+    }
+
+    const strategies = [
+        { name: 'CDP', fn: attemptTurnstileCdp },
+        { name: 'PlaywrightMouse', fn: attemptTurnstilePlaywrightMouse },
+        { name: 'IframeClick', fn: attemptTurnstileIframeClick }
+    ];
+
+    let round = 0;
+    while (Date.now() - startedAt < totalTimeoutMs) {
+        round++;
+        for (const strategy of strategies) {
+            if (Date.now() - startedAt >= totalTimeoutMs) break;
+
+            console.log(`[登录阶段] 第 ${round} 轮，策略=${strategy.name}`);
+            let clicked = false;
+            try {
+                clicked = await strategy.fn(page);
+            } catch (e) {
+                console.log(`[登录阶段] 策略 ${strategy.name} 异常: ${e.message}`);
+            }
+            console.log(`[登录阶段] 策略 ${strategy.name} 点击结果: ${clicked}`);
+
+            // 每次点击后轮询 token 最多 10 秒
+            const waitUntil = Math.min(Date.now() + 10000, startedAt + totalTimeoutMs);
+            while (Date.now() < waitUntil) {
+                const info = await getTurnstileTokenInfo(page);
+                if (info.found) {
+                    console.log(`[登录阶段] Turnstile token 已生成，字段=${info.selector}，长度=${info.length}`);
+                    return true;
+                }
+                await page.waitForTimeout(1000);
+            }
+
+            // 诊断：token 字段是否存在但为空
+            const diag = await getTurnstileTokenInfo(page);
+            console.log(`[登录阶段] token 诊断 fields=${JSON.stringify(diag.fields)} widgets=${JSON.stringify(diag.widgets)} iframes=${JSON.stringify(diag.iframes)}`);
+        }
+
+        // 轻微移动鼠标，模拟人类，再试下一轮
+        try {
+            await page.mouse.move(200 + Math.random() * 400, 200 + Math.random() * 200, { steps: 5 });
+        } catch (e) { }
+        await page.waitForTimeout(1500);
+    }
+
+    const finalInfo = await getTurnstileTokenInfo(page);
+    console.log(`[登录阶段] Turnstile token 等待超时。最终 fields=${JSON.stringify(finalInfo.fields)}`);
+    return false;
+}
+
 // --- 等待 Turnstile token 真正生成（点击成功 ≠ token 有效） ---
 async function waitForTurnstileToken(page, timeoutMs = 30000) {
     const startedAt = Date.now();
     console.log(`[登录阶段] 等待 Turnstile token 生成 (最长 ${timeoutMs}ms)...`);
 
     while (Date.now() - startedAt < timeoutMs) {
-        const tokenInfo = await page.evaluate(() => {
-            const selectors = [
-                'input[name="cf-turnstile-response"]',
-                'textarea[name="cf-turnstile-response"]',
-                'input[name="g-recaptcha-response"]',
-                'textarea[name="g-recaptcha-response"]'
-            ];
-
-            for (const selector of selectors) {
-                const element = document.querySelector(selector);
-                const value = (element && element.value ? element.value : '').trim();
-                if (value) {
-                    return {
-                        found: true,
-                        selector,
-                        length: value.length
-                    };
-                }
-            }
-
-            // 也检查 iframe 外可能的隐藏字段（querySelector 已覆盖主文档）
-            return {
-                found: false,
-                selector: null,
-                length: 0
-            };
-        }).catch(() => ({ found: false, selector: null, length: 0 }));
+        const tokenInfo = await getTurnstileTokenInfo(page);
 
         if (tokenInfo.found) {
             console.log(
@@ -293,7 +463,8 @@ async function waitForTurnstileToken(page, timeoutMs = 30000) {
         await page.waitForTimeout(1000);
     }
 
-    console.log('[登录阶段] Turnstile token 等待超时，未提交登录表单。');
+    const finalInfo = await getTurnstileTokenInfo(page);
+    console.log(`[登录阶段] Turnstile token 等待超时，未提交登录表单。fields=${JSON.stringify(finalInfo.fields)} iframes=${JSON.stringify(finalInfo.iframes)}`);
     return false;
 }
 
@@ -609,12 +780,19 @@ async function ensureScreenshotsDir() {
             console.log('访问登录页面...');
             await page.goto('https://dashboard.katabump.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // 登录页 Turnstile：点击 → 等待 token 真正生成 → 再填表提交
+            // 登录页 Turnstile：多策略点击 + 等 token 真正生成 → 再填表提交
             // 全程使用同一 page / context / 代理 / Cookie，不刷新、不重建 page
             await page.waitForTimeout(3000);
-            await solveTurnstileIfPresent(page, "登录阶段", 10, 5000);
 
-            const turnstileReady = await waitForTurnstileToken(page, 30000);
+            // 先做一次轻微人工鼠标活动，降低 bot 评分
+            try {
+                await page.mouse.move(100, 100, { steps: 5 });
+                await page.waitForTimeout(300);
+                await page.mouse.move(400, 300, { steps: 8 });
+                await page.waitForTimeout(200);
+            } catch (e) { }
+
+            const turnstileReady = await solveLoginTurnstile(page, 60000);
             if (!turnstileReady) {
                 console.error('   >> ⚠️ Turnstile 点击后未生成有效 token，不提交登录表单。');
                 runStatus = 'captcha_required';
@@ -639,12 +817,9 @@ async function ensureScreenshotsDir() {
                 await page.waitForTimeout(500);
 
                 // 提交前再确认 token 仍在（防止 fill 过程中失效）
-                const tokenStillValid = await page.evaluate(() => {
-                    const el = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], input[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"]');
-                    return !!(el && el.value && el.value.trim().length > 0);
-                }).catch(() => false);
+                const tokenStillValid = await getTurnstileTokenInfo(page);
 
-                if (!tokenStillValid) {
+                if (!tokenStillValid.found) {
                     console.error('   >> ⚠️ 提交前 Turnstile token 已丢失，不提交登录表单。');
                     runStatus = 'captcha_required';
                     blockMessage = 'Turnstile token disappeared before login submit';
@@ -655,7 +830,7 @@ async function ensureScreenshotsDir() {
                     );
                     continue;
                 }
-                console.log('[登录阶段] 提交前 token 仍有效，提交 Login...');
+                console.log(`[登录阶段] 提交前 token 仍有效，字段=${tokenStillValid.selector}，长度=${tokenStillValid.length}，提交 Login...`);
 
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
 
