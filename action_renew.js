@@ -118,7 +118,7 @@ const INJECTED_SCRIPT = `
 `;
 
 async function checkProxy() {
-    if (!PROXY_CONFIG) return true;
+    if (!PROXY_CONFIG) return { ok: true };
     console.log('[代理] 正在验证代理连接...');
     try {
         const axiosConfig = {
@@ -137,10 +137,10 @@ async function checkProxy() {
         }
         await axios.get('https://www.google.com', axiosConfig);
         console.log('[代理] 连接成功！');
-        return true;
+        return { ok: true };
     } catch (error) {
         console.error(`[代理] 连接失败: ${error.message}`);
-        return false;
+        return { ok: false, error: error.message };
     }
 }
 
@@ -1399,7 +1399,9 @@ async function ensureScreenshotsDir() {
                     const html = await page.content();
                     fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
                 } catch (e) { }
-                continue;
+                overallExitCode = EXIT_CODE.PROXY_RETRY;
+                shouldStopAllUsers = true;
+                break;
             }
 
             console.log('正在寻找 dashboard / server 入口...');
@@ -1461,7 +1463,9 @@ async function ensureScreenshotsDir() {
                         const html = await page.content();
                         fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
                     } catch (e) { }
-                    continue;
+                    overallExitCode = EXIT_CODE.PROXY_RETRY;
+                    shouldStopAllUsers = true;
+                    break;
                 }
 
                 console.log('login_failed: 未找到 dashboard 入口 (See / Access server / View / dashboard URL)。');
@@ -1887,6 +1891,13 @@ async function ensureScreenshotsDir() {
         } catch (e) { }
 
         // Telegram 通知
+        // Renew 循环出口守卫：unknown / unknown_blocked → FATAL
+        if (runStatus === 'unknown' || runStatus === 'unknown_blocked') {
+            console.error('   >> ⚠️ Renew 循环未得到明确结果 (runStatus=' + runStatus + ')，标记 FATAL');
+            runStatus = 'error';
+            blockMessage = 'Renew loop exhausted without clear result';
+        }
+
         if (runStatus === 'success') {
             await sendTelegramMessage(`✅ KataBump 续期完成\n用户: ${user.username}\n状态: 续期成功`);
         } else if (runStatus === 'not_ready') {
@@ -1899,7 +1910,12 @@ async function ensureScreenshotsDir() {
             await sendTelegramMessage(`ℹ️ KataBump 可能已续期\n用户: ${user.username}\nExpiry 未变化，可能本轮已是最新。`);
         }
 
-        if (runStatus === 'captcha_required') anyUserRetriedProxy = true;
+        // 仅登录阶段 captcha_required 才触发代理轮换；Renew ALTCHA 不换代理
+        if (runStatus === 'captcha_required') {
+            if (blockMessage && blockMessage.startsWith('Login')) {
+                anyUserRetriedProxy = true;
+            }
+        }
         if (runStatus === 'error') { overallExitCode = EXIT_CODE.FATAL; shouldStopAllUsers = true; }
         if (runStatus === 'login_failed') { overallExitCode = EXIT_CODE.LOGIN_FAILED; shouldStopAllUsers = true; }
         if (runStatus === 'success' && overallExitCode === EXIT_CODE.SUCCESS) overallExitCode = EXIT_CODE.SUCCESS;

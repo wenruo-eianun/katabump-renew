@@ -290,8 +290,13 @@ function runActionRenew(proxyLine) {
 
         // 5) 按退出码决定
         if (NON_RETRYABLE.has(code)) {
-            console.log(`[proxy-runner] 不可重试退出码 ${code}，结束本轮`);
-            process.exit(code);
+            // NOT_READY(3) 和 ALREADY_RENEWED(4) 是正常业务状态，归一为 0 避免 GitHub Actions 显示失败
+            const normalizedCode = (code === EXIT_CODE.NOT_READY || code === EXIT_CODE.ALREADY_RENEWED) ? EXIT_CODE.SUCCESS : code;
+            if (code !== normalizedCode) {
+                console.log(`[proxy-runner] 业务状态码 ${code} 归一为 ${normalizedCode}（正常业务，非失败）`);
+            }
+            console.log(`[proxy-runner] 不可重试退出码 ${normalizedCode}，结束本轮`);
+            process.exit(normalizedCode);
         }
 
         if (code === EXIT_CODE.PROXY_RETRY && proxyLine && selection) {
