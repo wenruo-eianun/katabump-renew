@@ -20,9 +20,17 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y xvfb
+        sudo apt-get install -y xvfb netcat-openbsd
         npm install
         npx playwright install-deps chrome
+
+    - name: Restore proxy cooldown cache
+      uses: actions/cache@v4
+      with:
+        path: proxy-cooldown.json
+        key: katabump-proxy-cooldown-${{ github.run_id }}
+        restore-keys: |
+          katabump-proxy-cooldown-
 
     - name: Download proxy list
       env:
@@ -50,3 +58,10 @@ jobs:
       with:
         name: screenshots
         path: screenshots/
+
+    - name: Save proxy cooldown cache
+      if: always()
+      uses: actions/cache@v4
+      with:
+        path: proxy-cooldown.json
+        key: katabump-proxy-cooldown-${{ github.run_id }}

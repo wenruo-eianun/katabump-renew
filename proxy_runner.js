@@ -98,11 +98,8 @@ function selectRandomProxy(proxies, cooldowns) {
     });
 
     if (available.length === 0) {
-        console.log('[proxy-runner] 无可选代理（全部冷却中），清空冷却后强制选一个');
-        saveCooldowns({});
-        return proxies.length > 0
-            ? { line: proxies[crypto.randomInt(proxies.length)], source: 'forced' }
-            : null;
+        console.log('[proxy-runner] 无可选代理（全部冷却中），本轮停止，不清空冷却名单');
+        return null;
     }
 
     const line = available[crypto.randomInt(available.length)];

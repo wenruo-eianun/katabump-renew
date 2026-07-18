@@ -11,6 +11,7 @@ const EXIT_CODE = {
     SUCCESS: 0,
     FATAL: 1,
     PROXY_RETRY: 42,      // Turnstile 3次仍失败 → 外层换代理，不与其他退出码冲突
+    RENEW_CAPTCHA_FAILED: 43, // Renew ALTCHA 失败，不换代理但也不返回成功
     NOT_READY: 3,         // 还没到续期窗口
     ALREADY_RENEWED: 4,   // Expiry 未变化，本轮已是最新
     LOGIN_FAILED: 5       // 账号或密码错误
@@ -118,7 +119,7 @@ const INJECTED_SCRIPT = `
 `;
 
 async function checkProxy() {
-    if (!PROXY_CONFIG) return { ok: true };
+    if (!PROXY_CONFIG) return { ok: true, error: null };
     console.log('[代理] 正在验证代理连接...');
     try {
         const axiosConfig = {
@@ -1206,7 +1207,11 @@ async function ensureScreenshotsDir() {
     }
 
     if (PROXY_CONFIG) {
-        if (!await checkProxy()) process.exit(1);
+        const checkResult = await checkProxy();
+    if (checkResult.ok === false) {
+        console.error('[代理] 连接失败，标记 PROXY_RETRY:', checkResult.error || 'unknown');
+        process.exit(EXIT_CODE.PROXY_RETRY);
+    }
     }
 
     await launchChrome();
@@ -1241,7 +1246,7 @@ async function ensureScreenshotsDir() {
     await page.addInitScript(INJECTED_SCRIPT);
 
     let overallExitCode = EXIT_CODE.SUCCESS;
-    let anyUserRetriedProxy = false;
+    let loginCaptchaFailed = false;
     let shouldStopAllUsers = false;
 
     for (let i = 0; i < users.length; i++) {
@@ -1293,6 +1298,7 @@ async function ensureScreenshotsDir() {
                             : `login_turnstile_token_missing_${user.username.replace(/[^a-z0-9]/gi, '_')}`;
                 await dumpDebugSnapshot(page, snapName);
                 overallExitCode = EXIT_CODE.PROXY_RETRY;
+                loginCaptchaFailed = true;
                 shouldStopAllUsers = true;
                 break;
             }
@@ -1910,10 +1916,15 @@ async function ensureScreenshotsDir() {
             await sendTelegramMessage(`ℹ️ KataBump 可能已续期\n用户: ${user.username}\nExpiry 未变化，可能本轮已是最新。`);
         }
 
-        // 仅登录阶段 captcha_required 才触发代理轮换；Renew ALTCHA 不换代理
+        // 仅登录阶段 captcha_required 才触发代理轮换
         if (runStatus === 'captcha_required') {
             if (blockMessage && blockMessage.startsWith('Login')) {
                 anyUserRetriedProxy = true;
+            } else {
+                // Renew ALTCHA 失败 → 不换代理，但也不能返回 SUCCESS
+                if (overallExitCode === EXIT_CODE.SUCCESS) {
+                    overallExitCode = EXIT_CODE.RENEW_CAPTCHA_FAILED;
+                }
             }
         }
         if (runStatus === 'error') { overallExitCode = EXIT_CODE.FATAL; shouldStopAllUsers = true; }
@@ -1949,9 +1960,12 @@ async function ensureScreenshotsDir() {
         process.exit(EXIT_CODE.FATAL);
     if (overallExitCode === EXIT_CODE.LOGIN_FAILED)
         process.exit(EXIT_CODE.LOGIN_FAILED);
-    // 若有用户请求换代理，优先返回 PROXY_RETRY
-    if (anyUserRetriedProxy)
+    // 仅登录 captcha 失败才触发代理轮换 (Renew ALTCHA 不换代理)
+    if (loginCaptchaFailed)
         process.exit(EXIT_CODE.PROXY_RETRY);
+    // RENEW_CAPTCHA_FAILED 是正常业务，归一为 0 避免 GHA 显示失败
+    if (overallExitCode === EXIT_CODE.RENEW_CAPTCHA_FAILED)
+        process.exit(EXIT_CODE.SUCCESS);
     // 其余情况
     process.exit(overallExitCode);
 })();
