@@ -89,6 +89,16 @@ IP:PORT:USERNAME:PASSWORD
 31.59.20.176:6754:username:password
 ```
 
+代理输入格式已冻结为以下三种之一：
+
+```text
+HOST:PORT
+HOST:PORT:USERNAME:PASSWORD
+http://USERNAME:PASSWORD@HOST:PORT
+```
+
+其中 `PORT` 必须是 1 到 65535 的十进制端口。HTTP URL 中的用户名和密码按 URL 编码填写；不带 `http://` 的行只按 Webshare 格式解释，不会猜测为其他语法。路径、查询参数、片段、多余字段以及包含空白、`@` 或反斜杠的主机会被拒绝。
+
 workflow 会自动执行：
 
 ```text
@@ -256,7 +266,7 @@ Node.js 20+
 在项目根目录运行：
 
 ```bash
-npm install
+npm ci
 ```
 
 ### 3. 配置账号

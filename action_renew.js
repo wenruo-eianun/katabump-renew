@@ -1,10 +1,18 @@
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const axios = require('axios');
+const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
-const { spawn, exec } = require('child_process');
-const http = require('http');
+const {
+    buildBrowserLaunchOptions,
+    classifyProxyResponse,
+    classifyProxyError,
+    validateUsersConfig,
+    safeAccountLabel,
+    finalizeAccountResources
+} = require('./lib/runtime_helpers');
+const { sendTelegramNotification } = require('./lib/telegram');
 
 // --- 退出码（供外层 proxy_runner.js 使用） ---
 const EXIT_CODE = {
@@ -22,39 +30,28 @@ const TG_CHAT_ID = process.env.TG_CHAT_ID;
 
 // --- 辅助函数：发送 Telegram ---
 async function sendTelegramMessage(message, imagePath = null) {
-    if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
-    try {
-        const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
-        await axios.post(url, {
-            chat_id: TG_CHAT_ID,
-            text: message
-        });
-        console.log('[Telegram] Message sent.');
-    } catch (e) {
-        console.error('[Telegram] Failed to send message:', e.message);
-    }
-    if (imagePath && fs.existsSync(imagePath)) {
-        console.log('[Telegram] Sending photo...');
-        const cmd = `curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" -F chat_id="${TG_CHAT_ID}" -F photo="@${imagePath}"`;
-        await new Promise(resolve => {
-            exec(cmd, (err) => {
-                if (err) console.error('[Telegram] Failed to send photo via curl:', err.message);
-                else console.log('[Telegram] Photo sent.');
-                resolve();
-            });
-        });
-    }
+    return sendTelegramNotification({
+        axios,
+        FormData,
+        fs,
+        token: TG_BOT_TOKEN,
+        chatId: TG_CHAT_ID,
+        message,
+        imagePath,
+        logger: console
+    });
 }
 
 chromium.use(stealth);
 
 const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
-const DEBUG_PORT = 9222;
 process.env.NO_PROXY = 'localhost,127.0.0.1';
 
 const HTTP_PROXY = process.env.HTTP_PROXY;
 const TARGET_LOGIN_URL = 'https://dashboard.katabump.com/auth/login';
 let PROXY_CONFIG = null;
+let PROXY_CONFIG_ERROR = null;
+let activeBrowser = null;
 
 if (HTTP_PROXY) {
     try {
@@ -70,7 +67,7 @@ if (HTTP_PROXY) {
         console.log(`[代理] 检测到配置: 服务器=${PROXY_CONFIG.server}, 认证=${PROXY_CONFIG.username ? '是' : '否'}`);
     } catch (e) {
         console.error('[代理] HTTP_PROXY 格式无效。');
-        process.exit(1);
+        PROXY_CONFIG_ERROR = e;
     }
 }
 
@@ -122,7 +119,7 @@ const INJECTED_SCRIPT = `
 `;
 
 async function checkProxy() {
-    if (!PROXY_CONFIG) return { ok: true, error: null };
+    if (!PROXY_CONFIG) return { ok: true, reachable: true, status: null, category: 'no_proxy', error: null };
     console.log('[代理] 正在验证代理连接...');
     try {
         const axiosConfig = {
@@ -139,78 +136,17 @@ async function checkProxy() {
                 password: PROXY_CONFIG.password
             };
         }
-        const response = await axios.get(TARGET_LOGIN_URL, {
-            ...axiosConfig,
-            validateStatus: () => true
-        });
-        console.log(`[代理] 目标页面可达，HTTP 状态=${response.status}`);
-        return { ok: true, status: response.status };
+        const response = await axios.get(TARGET_LOGIN_URL, axiosConfig);
+        const result = classifyProxyResponse(response.status);
+        console.log(`[代理] 目标页面响应：HTTP ${response.status}，分类=${result.category}`);
+        return result;
     } catch (error) {
-        console.error(`[代理] 连接失败: ${error.message}`);
-        return { ok: false, error: error.message };
+        const result = error.response && error.response.status
+            ? classifyProxyResponse(error.response.status)
+            : classifyProxyError(error);
+        console.error(`[代理] 预检失败：分类=${result.category}，错误=${result.error || 'none'}`);
+        return result;
     }
-}
-
-function checkPort(port) {
-    return new Promise((resolve) => {
-        const req = http.get(`http://localhost:${port}/json/version`, (res) => {
-            resolve(true);
-        });
-        req.on('error', () => resolve(false));
-        req.end();
-    });
-}
-
-async function launchChrome() {
-    console.log('检查 Chrome 是否已在端口 ' + DEBUG_PORT + ' 上运行...');
-    if (await checkPort(DEBUG_PORT)) {
-        console.log('Chrome 已开启。');
-        return;
-    }
-    console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
-    const args = [
-        `--remote-debugging-port=${DEBUG_PORT}`,
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-gpu',
-        '--window-size=1280,720',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--user-data-dir=/tmp/chrome_user_data',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--lang=en-US',
-        '--accept-lang=en-US,en'
-    ];
-    if (PROXY_CONFIG) {
-        args.push(`--proxy-server=${PROXY_CONFIG.server}`);
-        args.push('--proxy-bypass-list=<-loopback>');
-    }
-    const chrome = spawn(CHROME_PATH, args, {
-        detached: true,
-        stdio: 'ignore'
-    });
-    chrome.unref();
-    console.log('正在等待 Chrome 初始化...');
-    for (let i = 0; i < 20; i++) {
-        if (await checkPort(DEBUG_PORT)) break;
-        await new Promise(r => setTimeout(r, 1000));
-    }
-    if (!await checkPort(DEBUG_PORT)) {
-        throw new Error('Chrome 启动失败');
-    }
-}
-
-function getUsers() {
-    try {
-        if (process.env.USERS_JSON) {
-            const parsed = JSON.parse(process.env.USERS_JSON);
-            return Array.isArray(parsed) ? parsed : (parsed.users || []);
-        }
-    } catch (e) {
-        console.error('解析 USERS_JSON 环境变量错误:', e);
-    }
-    return [];
 }
 
 // --- 找到 Cloudflare Turnstile challenge frames（每次调用都重新扫描 page.frames，不缓存旧 frame） ---
@@ -1246,46 +1182,31 @@ function mergeExitCode(current, newCode) {
 // ============================================================
 //  主流程
 // ============================================================
-(async () => {
-    const users = getUsers();
-    if (users.length === 0) {
-        console.log('未在 process.env.USERS_JSON 中找到用户');
-        process.exit(1);
+async function runMain() {
+    const usersConfig = validateUsersConfig(process.env.USERS_JSON);
+    if (!usersConfig.valid) {
+        console.error(`[配置] USERS_JSON 无效：${usersConfig.reason}`);
+        return EXIT_CODE.FATAL;
     }
+    const users = usersConfig.users;
+
+    if (PROXY_CONFIG_ERROR) return EXIT_CODE.FATAL;
 
     if (PROXY_CONFIG) {
         const checkResult = await checkProxy();
-    if (checkResult.ok === false) {
-        console.error('[代理] 连接失败，标记 PROXY_RETRY:', checkResult.error || 'unknown');
-        process.exit(EXIT_CODE.PROXY_RETRY);
-    }
-    }
-
-    await launchChrome();
-
-    console.log('正在连接 Chrome...');
-    let browser;
-    for (let k = 0; k < 5; k++) {
-        try {
-            browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
-            console.log('连接成功！');
-            break;
-        } catch (e) {
-            console.log(`连接尝试 ${k + 1} 失败。2秒后重试...`);
-            await new Promise(r => setTimeout(r, 2000));
+        if (checkResult.ok === false) {
+            console.error(`[代理] 连接失败，分类=${checkResult.category}，标记 PROXY_RETRY`);
+            return EXIT_CODE.PROXY_RETRY;
         }
     }
-    if (!browser) process.exit(1);
 
-    const defaultContext = browser.contexts()[0];
-    const browserContextOptions = PROXY_CONFIG && PROXY_CONFIG.username
-        ? {
-            httpCredentials: {
-                username: PROXY_CONFIG.username,
-                password: PROXY_CONFIG.password
-            }
-        }
-        : {};
+    console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
+    activeBrowser = await chromium.launch({
+        executablePath: CHROME_PATH,
+        ...buildBrowserLaunchOptions(PROXY_CONFIG)
+    });
+    const browser = activeBrowser;
+    console.log('Chrome 启动成功。');
     let context = null;
     let page = null;
 
@@ -1296,6 +1217,7 @@ function mergeExitCode(current, newCode) {
 
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
+        const accountLabel = safeAccountLabel(user, i);
         console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`);
 
         let renewSuccess = false;
@@ -1304,9 +1226,13 @@ function mergeExitCode(current, newCode) {
         let blockMessage = '';
 
         try {
+            if (user.__invalidConfig) {
+                runStatus = 'login_failed';
+                blockMessage = 'Invalid account configuration';
+            } else {
             // 每个账号使用独立的 BrowserContext，隔离 Cookie、Storage、IndexedDB、
             // Service Worker、Cache Storage 以及其他 Context 级状态。
-            context = await browser.newContext(browserContextOptions);
+            context = await browser.newContext();
             page = await context.newPage();
             page.setDefaultTimeout(60000);
             await page.addInitScript(INJECTED_SCRIPT);
@@ -1338,12 +1264,12 @@ function mergeExitCode(current, newCode) {
                 blockMessage = turnstileResult.message || state;
                 renewSuccess = false;
                 const snapName = state === 'turnstile_verification_failed'
-                    ? `login_turnstile_verification_failed_${user.username.replace(/[^a-z0-9]/gi, '_')}`
+                    ? `login_turnstile_verification_failed_${accountLabel}`
                     : state === 'turnstile_widget_not_ready'
-                        ? `login_turnstile_widget_not_ready_${user.username.replace(/[^a-z0-9]/gi, '_')}`
+                        ? `login_turnstile_widget_not_ready_${accountLabel}`
                         : state === 'turnstile_click_target_missing'
-                            ? `login_turnstile_click_target_missing_${user.username.replace(/[^a-z0-9]/gi, '_')}`
-                            : `login_turnstile_token_missing_${user.username.replace(/[^a-z0-9]/gi, '_')}`;
+                            ? `login_turnstile_click_target_missing_${accountLabel}`
+                            : `login_turnstile_token_missing_${accountLabel}`;
                 await dumpDebugSnapshot(page, snapName);
                 loginCaptchaFailed = true;
                 shouldStopAllUsers = true;
@@ -1373,7 +1299,7 @@ function mergeExitCode(current, newCode) {
                         renewSuccess = false;
                         await dumpDebugSnapshot(
                             page,
-                            `login_turnstile_token_lost_${user.username.replace(/[^a-z0-9]/gi, '_')}`
+                            `login_turnstile_token_lost_${accountLabel}`
                         );
                         stopCurrentUser = true;
                     }
@@ -1385,10 +1311,10 @@ function mergeExitCode(current, newCode) {
                         // 登录后诊断：保存截图 + HTML，输出 URL / 标题 / body 片段
                         await page.waitForTimeout(2000);
                         const photoDir = await ensureScreenshotsDir();
-                        await page.screenshot({ path: path.join(photoDir, `login_after_submit_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                        await page.screenshot({ path: path.join(photoDir, `login_after_submit_${accountLabel}.png`), fullPage: true });
                         try {
                             const html = await page.content();
-                            fs.writeFileSync(path.join(photoDir, `login_after_submit_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
+                            fs.writeFileSync(path.join(photoDir, `login_after_submit_${accountLabel}.html`), html, 'utf-8');
                         } catch (e) { }
                         const loginUrl = page.url();
                         const loginTitle = await page.title();
@@ -1405,7 +1331,7 @@ function mergeExitCode(current, newCode) {
                                 runStatus = 'login_failed';
                                 blockMessage = 'Incorrect password or no account';
                                 const photoDir = await ensureScreenshotsDir();
-                                await page.screenshot({ path: path.join(photoDir, `login_failed_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                                await page.screenshot({ path: path.join(photoDir, `login_failed_${accountLabel}.png`), fullPage: true });
                                 stopCurrentUser = true;
                             }
                         } catch (e) { }
@@ -1422,10 +1348,10 @@ function mergeExitCode(current, newCode) {
                                 blockMessage = 'Login captcha was not accepted';
                                 renewSuccess = false;
                                 const photoDir2 = await ensureScreenshotsDir();
-                                await page.screenshot({ path: path.join(photoDir2, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                                await page.screenshot({ path: path.join(photoDir2, `login_captcha_required_${accountLabel}.png`), fullPage: true });
                                 try {
                                     const html2 = await page.content();
-                                    fs.writeFileSync(path.join(photoDir2, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html2, 'utf-8');
+                                    fs.writeFileSync(path.join(photoDir2, `login_captcha_required_${accountLabel}.html`), html2, 'utf-8');
                                 } catch (e) { }
                                 shouldStopAllUsers = true;
                             }
@@ -1445,10 +1371,10 @@ function mergeExitCode(current, newCode) {
                     blockMessage = 'Login captcha was not accepted';
                     renewSuccess = false;
                     const photoDir = await ensureScreenshotsDir();
-                    await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                    await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${accountLabel}.png`), fullPage: true });
                     try {
                         const html = await page.content();
-                        fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
+                        fs.writeFileSync(path.join(photoDir, `login_captcha_required_${accountLabel}.html`), html, 'utf-8');
                     } catch (e) { }
                     shouldStopAllUsers = true;
                 }
@@ -1509,10 +1435,10 @@ function mergeExitCode(current, newCode) {
                         blockMessage = 'Login captcha was not accepted';
                         renewSuccess = false;
                         const photoDir = await ensureScreenshotsDir();
-                        await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                        await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${accountLabel}.png`), fullPage: true });
                         try {
                             const html = await page.content();
-                            fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
+                            fs.writeFileSync(path.join(photoDir, `login_captcha_required_${accountLabel}.html`), html, 'utf-8');
                         } catch (e) { }
                         shouldStopAllUsers = true;
                     }
@@ -1522,7 +1448,7 @@ function mergeExitCode(current, newCode) {
                         runStatus = 'login_failed';
                         blockMessage = 'Dashboard entry not found after login';
                         const photoDir = await ensureScreenshotsDir();
-                        await page.screenshot({ path: path.join(photoDir, `login_failed_no_dashboard_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                        await page.screenshot({ path: path.join(photoDir, `login_failed_no_dashboard_${accountLabel}.png`), fullPage: true });
                         stopCurrentUser = true;
                     }
                 }
@@ -1931,33 +1857,21 @@ function mergeExitCode(current, newCode) {
                 }
 
             }
+            }
         } catch (err) {
             console.error(`Error processing user:`, err);
             runStatus = 'error';
             blockMessage = err.message;
         } finally {
-            // 截图和目录创建都是诊断增强项，任何失败都不能阻断账号会话清理。
-            let photoDir = null;
-            try {
-                photoDir = await ensureScreenshotsDir();
-            } catch (e) {
-                console.error('[cleanup] 截图目录不可用:', e.message);
-            }
-            if (photoDir && page) {
-                const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
-                try {
-                    await page.screenshot({ path: path.join(photoDir, `${safeUsername}.png`), fullPage: true });
-                } catch (e) { }
-            }
-            try {
-                if (page) await page.close();
-                if (context) await context.close();
-            } catch (e) {
-                console.log('[cleanup] 账号 BrowserContext 关闭异常:', e.message);
-            } finally {
-                page = null;
-                context = null;
-            }
+            await finalizeAccountResources({
+                page,
+                context,
+                ensureDir: ensureScreenshotsDir,
+                screenshotName: `${accountLabel}.png`,
+                logger: console.error
+            });
+            page = null;
+            context = null;
         }
 
         if (stopCurrentUser) {
@@ -2011,30 +1925,62 @@ function mergeExitCode(current, newCode) {
 
     console.log('\n全部账号处理完成。');
 
-    try {
-        // 可靠关闭浏览器
-        const contexts = browser.contexts();
-        for (const ctx of contexts) {
-            for (const p of ctx.pages()) await p.close().catch(() => {});
-            if (ctx !== defaultContext) await ctx.close().catch(() => {});
-        }
-        await browser.close().catch(() => {});
-    } catch (e) {
-        console.log('[cleanup] browser close 异常:', e.message);
-    }
+    if (overallExitCode === EXIT_CODE.FATAL) return EXIT_CODE.FATAL;
+    if (overallExitCode === EXIT_CODE.LOGIN_FAILED) return EXIT_CODE.LOGIN_FAILED;
+    // Login-stage proxy failure is a retryable business result and exits 42.
+    if (loginCaptchaFailed) return EXIT_CODE.PROXY_RETRY;
+    // Renew CAPTCHA failure is a business failure and exits 43.
+    if (overallExitCode === EXIT_CODE.RENEW_CAPTCHA_FAILED) return EXIT_CODE.RENEW_CAPTCHA_FAILED;
+    return overallExitCode;
+}
 
-    // 优先取覆盖性错误
-    if (overallExitCode === EXIT_CODE.FATAL)
-        process.exit(EXIT_CODE.FATAL);
-    if (overallExitCode === EXIT_CODE.LOGIN_FAILED)
-        process.exit(EXIT_CODE.LOGIN_FAILED);
-    // 仅登录 captcha 失败才触发代理轮换 (Renew ALTCHA 不换代理)
-    if (loginCaptchaFailed)
-        process.exit(EXIT_CODE.PROXY_RETRY);
-    // RENEW_CAPTCHA_FAILED 是正常业务，归一为 0 避免 GHA 显示失败
-    // RENEW_CAPTCHA_FAILED 是业务异常，保持 43 退出，GHA 显示失败是正常的
-    if (overallExitCode === EXIT_CODE.RENEW_CAPTCHA_FAILED)
-        process.exit(EXIT_CODE.RENEW_CAPTCHA_FAILED);
-    // 其余情况
-    process.exit(overallExitCode);
+async function closeActiveBrowser() {
+    const browser = activeBrowser;
+    activeBrowser = null;
+    if (!browser) return;
+
+    let contexts = [];
+    try {
+        contexts = browser.contexts();
+    } catch (error) {
+        console.error('[cleanup] 无法读取浏览器 Context:', error.message);
+    }
+    for (const context of contexts) {
+        let pages = [];
+        try {
+            pages = context.pages();
+        } catch (error) {
+            console.error('[cleanup] 无法读取 Context 页面:', error.message);
+        }
+        for (const page of pages) {
+            try {
+                await page.close();
+            } catch (error) {
+                console.error('[cleanup] 残留 page 关闭失败:', error.message);
+            }
+        }
+        try {
+            await context.close();
+        } catch (error) {
+            console.error('[cleanup] 残留 Context 关闭失败:', error.message);
+        }
+    }
+    try {
+        await browser.close();
+    } catch (error) {
+        console.error('[cleanup] browser.close 失败:', error.message);
+    }
+}
+
+(async () => {
+    let finalExitCode = EXIT_CODE.FATAL;
+    try {
+        finalExitCode = await runMain();
+    } catch (error) {
+        console.error('[主流程] 未处理异常:', error.message);
+        finalExitCode = EXIT_CODE.FATAL;
+    } finally {
+        await closeActiveBrowser();
+    }
+    process.exit(finalExitCode);
 })();

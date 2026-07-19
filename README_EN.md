@@ -28,9 +28,11 @@ This is the easiest way to set it up once and have it run automatically every da
     ```
 5.  **(Optional) Configure Proxy**:
     If you need to run behind a proxy (e.g. to avoid IP blocks), add a Secret named `HTTP_PROXY`.
-    -   **Format**:
-        -   No Auth: `http://ip:port`
-        -   With Auth: `http://username:password@ip:port`
+    -   **Supported proxy line formats**:
+        -   `HOST:PORT`
+        -   `HOST:PORT:USERNAME:PASSWORD`
+        -   `http://USERNAME:PASSWORD@HOST:PORT`
+    -   **Note**: Ports must be decimal values from 1 to 65535. Paths, query strings, fragments, extra fields, and unsafe host characters are rejected. Lines without `http://` are parsed only as the Webshare format.
     -   **Note**: The script validates the proxy before use. Default is disabled.
 6.  **(Optional) Telegram Notifications**:
     If you want to receive Telegram notifications (with screenshots) upon renewal success, failure, or skip, add the following Secrets:
@@ -57,7 +59,7 @@ Ensure you have [Node.js](https://nodejs.org/) installed (version v18+ recommend
 ### 2. Install Dependencies
 Open a terminal (PowerShell or CMD) in the project root directory and run:
 ```bash
-npm install
+npm ci
 ```
 
 ### 3. Configure Credentials
