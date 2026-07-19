@@ -1307,112 +1307,113 @@ async function ensureScreenshotsDir() {
                 shouldStopAllUsers = true;
                 // break removed - let unified finalize handle
             }
-            console.log(`[登录阶段] state=${turnstileResult.state}，可以填写凭据并提交。`);
+            if (!shouldStopAllUsers) {
+                console.log(`[登录阶段] state=${turnstileResult.state}，可以填写凭据并提交。`);
 
-            console.log('正在输入凭据...');
-            try {
-                const emailInput = page.getByRole('textbox', { name: 'Email' });
-                await emailInput.waitFor({ state: 'visible', timeout: 5000 });
-                await emailInput.fill(user.username);
-
-                const pwdInput = page.getByRole('textbox', { name: 'Password' });
-                await pwdInput.fill(user.password);
-
-                await page.waitForTimeout(500);
-
-                // 提交前再确认 token 仍在（防止 fill 过程中失效）
-                const tokenStillValid = await getTurnstileTokenInfo(page);
-
-                if (!tokenStillValid.found) {
-                    console.error('   >> ⚠️ 提交前 Turnstile token 已丢失，不提交登录表单。');
-                    runStatus = 'login_captcha_required';
-                    blockMessage = 'Turnstile token disappeared before login submit';
-                    renewSuccess = false;
-                    await dumpDebugSnapshot(
-                        page,
-                        `login_turnstile_token_lost_${user.username.replace(/[^a-z0-9]/gi, '_')}`
-                    );
-                    overallExitCode = EXIT_CODE.PROXY_RETRY;
-                    shouldStopAllUsers = true;
-                    // break removed - let unified finalize handle
-                }
-                console.log(`[登录阶段] 提交前 token 仍有效，字段=${tokenStillValid.selector}，长度=${tokenStillValid.length}，提交 Login...`);
-
-                await page.getByRole('button', { name: 'Login', exact: true }).click();
-
-                // 登录后诊断：保存截图 + HTML，输出 URL / 标题 / body 片段
-                await page.waitForTimeout(2000);
-                const photoDir = await ensureScreenshotsDir();
-                await page.screenshot({ path: path.join(photoDir, `login_after_submit_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                console.log('正在输入凭据...');
                 try {
-                    const html = await page.content();
-                    fs.writeFileSync(path.join(photoDir, `login_after_submit_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
-                } catch (e) { }
-                const loginUrl = page.url();
-                const loginTitle = await page.title();
-                const loginBody = await getPageText(page);
-                console.log(`[登录诊断] 当前 URL: ${loginUrl}`);
-                console.log(`[登录诊断] 页面标题: ${loginTitle}`);
-                console.log(`[登录诊断] body 前500字符: ${loginBody.substring(0, 500)}`);
+                    const emailInput = page.getByRole('textbox', { name: 'Email' });
+                    await emailInput.waitFor({ state: 'visible', timeout: 5000 });
+                    await emailInput.fill(user.username);
 
-                // 检查登录错误
-                try {
-                    const errorMsg = page.getByText('Incorrect password or no account');
-                    if (await errorMsg.isVisible({ timeout: 3000 })) {
-                        console.error(`   >> ❌ 登录失败: 账号或密码错误`);
-                        runStatus = 'login_failed';
-                        blockMessage = 'Incorrect password or no account';
-                        const photoDir = await ensureScreenshotsDir();
-                        await page.screenshot({ path: path.join(photoDir, `login_failed_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                        overallExitCode = EXIT_CODE.LOGIN_FAILED;
-                        shouldStopAllUsers = true;
-                        // break removed - let unified finalize handle
-                    }
-                } catch (e) { }
+                    const pwdInput = page.getByRole('textbox', { name: 'Password' });
+                    await pwdInput.fill(user.password);
 
-                // 检查验证码是否被服务端接受（error=captcha / Please complete captcha）
-                {
-                    const captchaUrlHit = /error=captcha/i.test(loginUrl);
-                    const captchaTextHit = /Please complete captcha/i.test(loginBody)
-                        || /captcha required/i.test(loginBody)
-                        || /complete captcha/i.test(loginBody);
-                    if (captchaUrlHit || captchaTextHit) {
-                        console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${loginUrl})`);
+                    await page.waitForTimeout(500);
+
+                    // 提交前再确认 token 仍在（防止 fill 过程中失效）
+                    const tokenStillValid = await getTurnstileTokenInfo(page);
+
+                    if (!tokenStillValid.found) {
+                        console.error('   >> ⚠️ 提交前 Turnstile token 已丢失，不提交登录表单。');
                         runStatus = 'login_captcha_required';
-                        blockMessage = 'Login captcha was not accepted';
+                        blockMessage = 'Turnstile token disappeared before login submit';
                         renewSuccess = false;
-                        const photoDir2 = await ensureScreenshotsDir();
-                        await page.screenshot({ path: path.join(photoDir2, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                        try {
-                            const html2 = await page.content();
-                            fs.writeFileSync(path.join(photoDir2, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html2, 'utf-8');
-                        } catch (e) { }
+                        await dumpDebugSnapshot(
+                            page,
+                            `login_turnstile_token_lost_${user.username.replace(/[^a-z0-9]/gi, '_')}`
+                        );
                         overallExitCode = EXIT_CODE.PROXY_RETRY;
                         shouldStopAllUsers = true;
-                        // break removed - let unified finalize handle
                     }
-                }
+                    if (!shouldStopAllUsers) {
+                        console.log(`[登录阶段] 提交前 token 仍有效，字段=${tokenStillValid.selector}，长度=${tokenStillValid.length}，提交 Login...`);
 
-            } catch (e) {
-                console.log('登录操作遇到异常 (可能是已登录或超时):', e.message);
+                        await page.getByRole('button', { name: 'Login', exact: true }).click();
+
+                        // 登录后诊断：保存截图 + HTML，输出 URL / 标题 / body 片段
+                        await page.waitForTimeout(2000);
+                        const photoDir = await ensureScreenshotsDir();
+                        await page.screenshot({ path: path.join(photoDir, `login_after_submit_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                        try {
+                            const html = await page.content();
+                            fs.writeFileSync(path.join(photoDir, `login_after_submit_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
+                        } catch (e) { }
+                        const loginUrl = page.url();
+                        const loginTitle = await page.title();
+                        const loginBody = await getPageText(page);
+                        console.log(`[登录诊断] 当前 URL: ${loginUrl}`);
+                        console.log(`[登录诊断] 页面标题: ${loginTitle}`);
+                        console.log(`[登录诊断] body 前500字符: ${loginBody.substring(0, 500)}`);
+
+                        // 检查登录错误
+                        try {
+                            const errorMsg = page.getByText('Incorrect password or no account');
+                            if (await errorMsg.isVisible({ timeout: 3000 })) {
+                                console.error(`   >> ❌ 登录失败: 账号或密码错误`);
+                                runStatus = 'login_failed';
+                                blockMessage = 'Incorrect password or no account';
+                                const photoDir = await ensureScreenshotsDir();
+                                await page.screenshot({ path: path.join(photoDir, `login_failed_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                                overallExitCode = EXIT_CODE.LOGIN_FAILED;
+                                shouldStopAllUsers = true;
+                            }
+                        } catch (e) { }
+
+                        if (!shouldStopAllUsers) {
+                            // 检查验证码是否被服务端接受（error=captcha / Please complete captcha）
+                            const captchaUrlHit = /error=captcha/i.test(loginUrl);
+                            const captchaTextHit = /Please complete captcha/i.test(loginBody)
+                                || /captcha required/i.test(loginBody)
+                                || /complete captcha/i.test(loginBody);
+                            if (captchaUrlHit || captchaTextHit) {
+                                console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${loginUrl})`);
+                                runStatus = 'login_captcha_required';
+                                blockMessage = 'Login captcha was not accepted';
+                                renewSuccess = false;
+                                const photoDir2 = await ensureScreenshotsDir();
+                                await page.screenshot({ path: path.join(photoDir2, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                                try {
+                                    const html2 = await page.content();
+                                    fs.writeFileSync(path.join(photoDir2, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html2, 'utf-8');
+                                } catch (e) { }
+                                overallExitCode = EXIT_CODE.PROXY_RETRY;
+                                shouldStopAllUsers = true;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.log('登录操作遇到异常 (可能是已登录或超时):', e.message);
+                }
             }
 
             // 2. 登录后进入 dashboard（多策略 fallback）
-            // 再次确认当前 URL 不含 error=captcha（防止 try 块外漏检）
-            if (/error=captcha/i.test(page.url())) {
-                console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${page.url()})`);
-                runStatus = 'login_captcha_required';
-                blockMessage = 'Login captcha was not accepted';
-                renewSuccess = false;
-                const photoDir = await ensureScreenshotsDir();
-                await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                try {
-                    const html = await page.content();
-                    fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
-                } catch (e) { }
-                overallExitCode = EXIT_CODE.PROXY_RETRY;
-                shouldStopAllUsers = true;
-                // break removed - let unified finalize handle
+            if (!shouldStopAllUsers) {
+                // 再次确认当前 URL 不含 error=captcha（防止 try 块外漏检）
+                if (/error=captcha/i.test(page.url())) {
+                    console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${page.url()})`);
+                    runStatus = 'login_captcha_required';
+                    blockMessage = 'Login captcha was not accepted';
+                    renewSuccess = false;
+                    const photoDir = await ensureScreenshotsDir();
+                    await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                    try {
+                        const html = await page.content();
+                        fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
+                    } catch (e) { }
+                    overallExitCode = EXIT_CODE.PROXY_RETRY;
+                    shouldStopAllUsers = true;
+                }
             }
 
             if (!shouldStopAllUsers) {
@@ -1763,8 +1764,8 @@ async function ensureScreenshotsDir() {
 
                     if (newExpiry && oldExpiry && newExpiry !== oldExpiry) {
                         console.log(`   >> ✅ Expiry 已变化: ${oldExpiry} → ${newExpiry}，续期成功！`);
-                        renewSuccess = false;
-                        runStatus = 'unknown';
+                        renewSuccess = true;
+                        runStatus = 'success';
                         const photoDir = await ensureScreenshotsDir();
                         await page.screenshot({ path: path.join(photoDir, `renew_success_${attempt}.png`), fullPage: true });
                         break;
