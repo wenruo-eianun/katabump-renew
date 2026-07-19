@@ -1291,7 +1291,7 @@ async function ensureScreenshotsDir() {
             if (!turnstileResult.ok) {
                 const state = turnstileResult.state || 'turnstile_token_missing';
                 console.error(`   >> ⚠️ Turnstile 未通过。state=${state} message=${turnstileResult.message}`);
-                runStatus = 'captcha_required';
+                runStatus = 'login_captcha_required';
                 blockMessage = turnstileResult.message || state;
                 renewSuccess = false;
                 const snapName = state === 'turnstile_verification_failed'
@@ -1305,7 +1305,7 @@ async function ensureScreenshotsDir() {
                 overallExitCode = EXIT_CODE.PROXY_RETRY;
                 loginCaptchaFailed = true;
                 shouldStopAllUsers = true;
-                break;
+                // break removed - let unified finalize handle
             }
             console.log(`[登录阶段] state=${turnstileResult.state}，可以填写凭据并提交。`);
 
@@ -1334,7 +1334,7 @@ async function ensureScreenshotsDir() {
                     );
                     overallExitCode = EXIT_CODE.PROXY_RETRY;
                     shouldStopAllUsers = true;
-                    break;
+                    // break removed - let unified finalize handle
                 }
                 console.log(`[登录阶段] 提交前 token 仍有效，字段=${tokenStillValid.selector}，长度=${tokenStillValid.length}，提交 Login...`);
 
@@ -1366,7 +1366,7 @@ async function ensureScreenshotsDir() {
                         await page.screenshot({ path: path.join(photoDir, `login_failed_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
                         overallExitCode = EXIT_CODE.LOGIN_FAILED;
                         shouldStopAllUsers = true;
-                        break;
+                        // break removed - let unified finalize handle
                     }
                 } catch (e) { }
 
@@ -1389,7 +1389,7 @@ async function ensureScreenshotsDir() {
                         } catch (e) { }
                         overallExitCode = EXIT_CODE.PROXY_RETRY;
                         shouldStopAllUsers = true;
-                        break;
+                        // break removed - let unified finalize handle
                     }
                 }
 
@@ -1412,95 +1412,97 @@ async function ensureScreenshotsDir() {
                 } catch (e) { }
                 overallExitCode = EXIT_CODE.PROXY_RETRY;
                 shouldStopAllUsers = true;
-                break;
+                // break removed - let unified finalize handle
             }
 
-            console.log('正在寻找 dashboard / server 入口...');
+            if (!shouldStopAllUsers) {
+                console.log('正在寻找 dashboard / server 入口...');
 
-            let dashboardReady = false;
+                let dashboardReady = false;
 
-            // 策略 1: URL 已包含 dashboard（排除仍在 /auth/login 的情况）
-            try {
-                await page.waitForURL(url => /dashboard/i.test(url) && !/auth\/login/i.test(url), { timeout: 5000 });
-                console.log('[登录] URL 已跳转到 dashboard。');
-                dashboardReady = true;
-            } catch (e) { }
-
-            // 策略 2: 页面文本包含 dashboard / server identifier / 服务器列表
-            if (!dashboardReady) {
-                const bodyText = await getPageText(page);
-                if (/dashboard/i.test(bodyText) && /server/i.test(bodyText) && !/Please complete captcha/i.test(bodyText)) {
-                    console.log('[登录] 页面文本检测到 dashboard + server，判定登录成功。');
+                // 策略 1: URL 已包含 dashboard（排除仍在 /auth/login 的情况）
+                try {
+                    await page.waitForURL(url => /dashboard/i.test(url) && !/auth\/login/i.test(url), { timeout: 5000 });
+                    console.log('[登录] URL 已跳转到 dashboard。');
                     dashboardReady = true;
-                }
-            }
+                } catch (e) { }
 
-            // 策略 3: 查找 "See" 按钮
-            if (!dashboardReady) {
+                // 策略 2: 页面文本包含 dashboard / server identifier / 服务器列表
+                if (!dashboardReady) {
+                    const bodyText = await getPageText(page);
+                    if (/dashboard/i.test(bodyText) && /server/i.test(bodyText) && !/Please complete captcha/i.test(bodyText)) {
+                        console.log('[登录] 页面文本检测到 dashboard + server，判定登录成功。');
+                        dashboardReady = true;
+                    }
+                }
+
+                // 策略 3: 查找 "See" 按钮
+                if (!dashboardReady) {
+                    try {
+                        const seeBtn = page.getByRole('link', { name: 'See' }).first();
+                        await seeBtn.waitFor({ timeout: 5000 });
+                        console.log('[登录] 找到 "See" 按钮。');
+                        dashboardReady = true;
+                    } catch (e) { }
+                }
+
+                // 策略 4: 查找 "Access server" / "View" 按钮
+                if (!dashboardReady) {
+                    const altBtns = ['Access server', 'View', 'Manage', 'Servers', 'My Servers'];
+                    for (const btnName of altBtns) {
+                        try {
+                            const btn = page.getByRole('link', { name: btnName }).first();
+                            await btn.waitFor({ timeout: 2000 });
+                            console.log(`[登录] 找到 "${btnName}" 按钮。`);
+                            dashboardReady = true;
+                            break;
+                        } catch (e) { }
+                    }
+                }
+
+                if (!dashboardReady) {
+                    // 最后再检查一次 captcha 错误，避免误标为 login_failed
+                    const finalUrl = page.url();
+                    const finalBody = await getPageText(page);
+                    if (/error=captcha/i.test(finalUrl) || /Please complete captcha/i.test(finalBody) || /complete captcha/i.test(finalBody)) {
+                        console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${finalUrl})`);
+                        runStatus = 'login_captcha_required';
+                        blockMessage = 'Login captcha was not accepted';
+                        renewSuccess = false;
+                        const photoDir = await ensureScreenshotsDir();
+                        await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                        try {
+                            const html = await page.content();
+                            fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
+                        } catch (e) { }
+                        overallExitCode = EXIT_CODE.PROXY_RETRY;
+                        shouldStopAllUsers = true;
+                    }
+
+                    if (!shouldStopAllUsers) {
+                        console.log('login_failed: 未找到 dashboard 入口 (See / Access server / View / dashboard URL)。');
+                        runStatus = 'login_failed';
+                        blockMessage = 'Dashboard entry not found after login';
+                        const photoDir = await ensureScreenshotsDir();
+                        await page.screenshot({ path: path.join(photoDir, `login_failed_no_dashboard_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                        overallExitCode = EXIT_CODE.LOGIN_FAILED;
+                        shouldStopAllUsers = true;
+                    }
+                }
+
+                // 如果有 See 按钮，点击它；否则认为已在 dashboard 页面
                 try {
                     const seeBtn = page.getByRole('link', { name: 'See' }).first();
-                    await seeBtn.waitFor({ timeout: 5000 });
-                    console.log('[登录] 找到 "See" 按钮。');
-                    dashboardReady = true;
+                    if (await seeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+                        await seeBtn.click();
+                        console.log('[登录] 已点击 See 按钮。');
+                    }
                 } catch (e) { }
             }
 
-            // 策略 4: 查找 "Access server" / "View" 按钮
-            if (!dashboardReady) {
-                const altBtns = ['Access server', 'View', 'Manage', 'Servers', 'My Servers'];
-                for (const btnName of altBtns) {
-                    try {
-                        const btn = page.getByRole('link', { name: btnName }).first();
-                        await btn.waitFor({ timeout: 2000 });
-                        console.log(`[登录] 找到 "${btnName}" 按钮。`);
-                        dashboardReady = true;
-                        break;
-                    } catch (e) { }
-                }
-            }
-
-            if (!dashboardReady) {
-                // 最后再检查一次 captcha 错误，避免误标为 login_failed
-                const finalUrl = page.url();
-                const finalBody = await getPageText(page);
-                if (/error=captcha/i.test(finalUrl) || /Please complete captcha/i.test(finalBody) || /complete captcha/i.test(finalBody)) {
-                    console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${finalUrl})`);
-                    runStatus = 'login_captcha_required';
-                    blockMessage = 'Login captcha was not accepted';
-                    renewSuccess = false;
-                    const photoDir = await ensureScreenshotsDir();
-                    await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                    try {
-                        const html = await page.content();
-                        fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
-                    } catch (e) { }
-                    overallExitCode = EXIT_CODE.PROXY_RETRY;
-                    shouldStopAllUsers = true;
-                    break;
-                }
-
-                console.log('login_failed: 未找到 dashboard 入口 (See / Access server / View / dashboard URL)。');
-                runStatus = 'login_failed';
-                blockMessage = 'Dashboard entry not found after login';
-                const photoDir = await ensureScreenshotsDir();
-                await page.screenshot({ path: path.join(photoDir, `login_failed_no_dashboard_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                overallExitCode = EXIT_CODE.LOGIN_FAILED;
-                shouldStopAllUsers = true;
-                break;
-            }
-
-            // 如果有 See 按钮，点击它；否则认为已在 dashboard 页面
-            try {
-                const seeBtn = page.getByRole('link', { name: 'See' }).first();
-                if (await seeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-                    await seeBtn.click();
-                    console.log('[登录] 已点击 See 按钮。');
-                }
-            } catch (e) { }
-
             // 3. Renew 主循环
+            if (!shouldStopAllUsers) {
             for (let attempt = 1; attempt <= 20; attempt++) {
-                console.log(`\n[尝试 ${attempt}/20] 正在寻找 Renew 按钮...`);
                 const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
 
                 try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { }
@@ -1761,8 +1763,8 @@ async function ensureScreenshotsDir() {
 
                     if (newExpiry && oldExpiry && newExpiry !== oldExpiry) {
                         console.log(`   >> ✅ Expiry 已变化: ${oldExpiry} → ${newExpiry}，续期成功！`);
-                        renewSuccess = true;
-                        runStatus = 'success';
+                        renewSuccess = false;
+                        runStatus = 'unknown';
                         const photoDir = await ensureScreenshotsDir();
                         await page.screenshot({ path: path.join(photoDir, `renew_success_${attempt}.png`), fullPage: true });
                         break;
@@ -1775,8 +1777,8 @@ async function ensureScreenshotsDir() {
                         break;
                     } else {
                         console.log('   >> Modal 已关闭，但无法读取新 Expiry，标记 unknown。');
-                        renewSuccess = true;
-                        runStatus = 'success';
+                        renewSuccess = false;
+                        runStatus = 'unknown';
                         break;
                     }
                 }
@@ -1884,6 +1886,7 @@ async function ensureScreenshotsDir() {
                 await page.waitForTimeout(3000);
             }
 
+            }
         } catch (err) {
             console.error(`Error processing user:`, err);
             runStatus = 'error';
@@ -1915,6 +1918,8 @@ async function ensureScreenshotsDir() {
             await sendTelegramMessage(`⏳ KataBump 本轮未续期\n用户: ${user.username}\n原因: ${blockMessage}\nCron 将在下次继续检查。`);
         } else if (runStatus === 'captcha_required') {
             await sendTelegramMessage(`⚠️ KataBump 验证码阻断\n用户: ${user.username}\n原因: ${blockMessage}\n请检查验证码状态。`);
+        } else if (runStatus === 'login_captcha_required') {
+            await sendTelegramMessage(`⚠️ KataBump 登录验证码阻断\n用户: ${user.username}\n原因: ${blockMessage}\n请解决验证码后重试。`);
         } else if (runStatus === 'login_failed') {
             await sendTelegramMessage(`❌ KataBump 登录失败\n用户: ${user.username}\n原因: ${blockMessage}`);
         } else if (runStatus === 'already_renewed') {
