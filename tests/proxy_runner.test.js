@@ -1,11 +1,11 @@
 const assert = require('assert');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
 function runCheck() {
-    execSync('node --check ../proxy_runner.js', { cwd: __dirname, stdio: 'pipe' });
-    execSync('node --check ../action_renew.js', { cwd: __dirname, stdio: 'pipe' });
+    execFileSync(process.execPath, ['--check', '../proxy_runner.js'], { cwd: __dirname, stdio: 'pipe' });
+    execFileSync(process.execPath, ['--check', '../action_renew.js'], { cwd: __dirname, stdio: 'pipe' });
 }
 
 function safeRequire() {
@@ -19,6 +19,7 @@ function tests() {
     assert.strictEqual(typeof mod.parseProxyLine, 'function');
     assert.strictEqual(typeof mod.buildHttpProxy, 'function');
     assert.strictEqual(typeof mod.maskProxyUrl, 'function');
+    assert.strictEqual(typeof mod.emitGithubMask, 'function');
     assert.strictEqual(typeof mod.loadProxies, 'function');
     assert.strictEqual(typeof mod.selectRandomProxy, 'function');
     assert.strictEqual(typeof mod.proxyKey, 'function');
@@ -34,8 +35,24 @@ function tests() {
             expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'pass', valid: true }
         },
         {
+            line: 'http://user:pass@host:8080:garbage',
+            expect: { valid: false, reason: 'invalid_url_format' }
+        },
+        {
+            line: 'http://user:pa%40ss@host:8080',
+            expect: { ip: 'host', port: '8080', username: 'user', password: 'pa@ss', valid: true }
+        },
+        {
             line: '1.2.3.4:8080',
             expect: { ip: '1.2.3.4', port: '8080', username: '', password: '', valid: true }
+        },
+        {
+            line: 'host:80',
+            expect: { ip: 'host', port: '80', username: '', password: '', valid: true }
+        },
+        {
+            line: 'Proxy.EXAMPLE.com:8080:user:pass',
+            expect: { ip: 'proxy.example.com', port: '8080', username: 'user', password: 'pass', valid: true }
         },
         {
             line: '1.2.3.4:0',
@@ -90,24 +107,28 @@ function tests() {
             expect: { valid: false, reason: 'invalid_credentials' }
         },
         {
-            line: 'user:123:secret@1.2.3.4:8080',
-            expect: { valid: false, reason: 'ambiguous_format_use_webshare_or_http_url' }
+            line: 'user1:8080:pass@host:3128',
+            expect: { ip: 'user1', port: '8080', username: 'pass@host', password: '3128', valid: true }
         },
         {
-            line: 'user:pa:ss@1.2.3.4:8080',
-            expect: { valid: false, reason: 'ambiguous_format_use_webshare_or_http_url' }
+            line: 'user:pass@host:8080',
+            expect: { valid: false, reason: 'invalid_field_count:3' }
         },
         {
-            line: 'user:pass@1.2.3.4:8080',
-            expect: { valid: false, reason: 'ambiguous_format_use_webshare_or_http_url' }
-        },
-        {
-            line: 'user:pass@1.2.3.4:8080:garbage',
-            expect: { valid: false, reason: 'ambiguous_format_use_webshare_or_http_url' }
+            line: 'proxy:8080:user:pa@ss',
+            expect: { ip: 'proxy', port: '8080', username: 'user', password: 'pa@ss', valid: true }
         },
         {
             line: 'bad host:8080',
             expect: { valid: false, reason: 'invalid_host' }
+        },
+        {
+            line: 'foo@bar:8080',
+            expect: { valid: false, reason: 'invalid_host' }
+        },
+        {
+            line: 'bad%host:8080',
+            expect: { ip: 'bad%host', port: '8080', username: '', password: '', valid: true, builds: false }
         },
         {
             line: '1.2.3.4:8080:user:pa@ss:one:two',
@@ -125,6 +146,10 @@ function tests() {
         assert.strictEqual(parsed.password, sample.expect.password, `password mismatch: ${sample.line}`);
         if (parsed.valid) {
             const built = mod.buildHttpProxy(parsed);
+            if (sample.expect.builds === false) {
+                assert.strictEqual(built, null, `build should reject: ${sample.line}`);
+                continue;
+            }
             assert.strictEqual(built, `http://${parsed.username ? `${encodeURIComponent(parsed.username)}:${encodeURIComponent(parsed.password)}@` : ''}${parsed.ip}:${parsed.port}`);
             assert.strictEqual(mod.proxyKey(parsed), `${parsed.ip}:${parsed.port}`);
             assert.strictEqual(mod.safeProxyId(parsed), `${parsed.ip}:${parsed.port}`);
@@ -134,6 +159,21 @@ function tests() {
     const masked = mod.maskProxyUrl('http://myuser:mypass@1.2.3.4:8080');
     assert.ok(!masked.includes('myuser'), 'masked url must not include username');
     assert.ok(!masked.includes('mypass'), 'masked url must not include password');
+
+    const maskedDefaultPort = mod.maskProxyUrl('http://myuser:mypass@host:80');
+    assert.strictEqual(maskedDefaultPort, 'http://***:***@host:80');
+
+    assert.strictEqual(
+        mod.buildHttpProxy({ valid: true, ip: 'foo@bar', port: '8080', username: '', password: '' }),
+        null,
+        'host containing @ must not be reinterpreted as URL credentials'
+    );
+
+    const localMaskOutput = [];
+    mod.emitGithubMask('http://user:pass@host:8080', { GITHUB_ACTIONS: 'false' }, line => localMaskOutput.push(line));
+    assert.deepStrictEqual(localMaskOutput, [], 'local runs must not print GitHub mask commands');
+    mod.emitGithubMask('http://user:pass@host:8080', { GITHUB_ACTIONS: 'true' }, line => localMaskOutput.push(line));
+    assert.deepStrictEqual(localMaskOutput, ['::add-mask::http://user:pass@host:8080']);
 
     const selected = mod.selectRandomProxy([mod.parseProxyLine('1.2.3.4:8080:user:pass')], {});
     assert.ok(selected, 'selectRandomProxy should return parsed object');
@@ -158,12 +198,12 @@ function tests() {
         const origExistsSync = fs.existsSync;
         const origReadFileSync = fs.readFileSync;
         fs.existsSync = () => true;
-        fs.readFileSync = () => '1.2.3.4:99999:user:pass\nbadline\n';
+        fs.readFileSync = () => '1.2.3.4:99999:user:pass\nbadline\nbad%host:8080\n';
         try {
             const allInvalid = mod.loadProxies();
             assert.strictEqual(allInvalid.configured, true);
             assert.deepStrictEqual(allInvalid.valid, []);
-            assert.strictEqual(allInvalid.invalidCount, 2);
+            assert.strictEqual(allInvalid.invalidCount, 3);
         } finally {
             fs.existsSync = origExistsSync;
             fs.readFileSync = origReadFileSync;
@@ -175,12 +215,12 @@ function tests() {
         const origExistsSync = fs.existsSync;
         const origReadFileSync = fs.readFileSync;
         fs.existsSync = () => true;
-        fs.readFileSync = () => '1.2.3.4:8080:user:pass\nbadline\n5.6.7.8:3128:u2:p2\n';
+        fs.readFileSync = () => '1.2.3.4:8080:user:pass\nbadline\nbad%host:8080\n5.6.7.8:3128:u2:p2\n';
         try {
             const mixed = mod.loadProxies();
             assert.strictEqual(mixed.configured, true);
             assert.strictEqual(mixed.valid.length, 2);
-            assert.strictEqual(mixed.invalidCount, 1);
+            assert.strictEqual(mixed.invalidCount, 2);
         } finally {
             fs.existsSync = origExistsSync;
             fs.readFileSync = origReadFileSync;
