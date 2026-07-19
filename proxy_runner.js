@@ -1,15 +1,21 @@
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
+const axios = require('axios');
+const FormData = require('form-data');
 const {
     normalizeTimeoutMinutes,
     runChildWithTimeout,
     DEFAULT_GRACEFUL_TERMINATION_MS
 } = require('./lib/runtime_helpers');
+const { sendTelegramNotification } = require('./lib/telegram');
 
 const ACTION_TIMEOUT_MINUTES = normalizeTimeoutMinutes(process.env.ACTION_TIMEOUT_MINUTES);
 const ACTION_TIMEOUT_MS = ACTION_TIMEOUT_MINUTES * 60 * 1000;
+const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
+const TG_CHAT_ID = process.env.TG_CHAT_ID;
 
 // --- 退出码（与 action_renew.js 完全一致） ---
 const EXIT_CODE = {
@@ -38,6 +44,140 @@ const CONFIG = {
     COOLDOWN_HOURS: 4,
     PROXIES_FILE: path.join(process.cwd(), 'proxies.txt')
 };
+
+function createAttemptResultFile(attempt) {
+    const nonce = crypto.randomBytes(8).toString('hex');
+    return path.join(os.tmpdir(), `katabump-action-result-${process.pid}-${attempt}-${nonce}.json`);
+}
+
+function readActionResult(resultFile) {
+    if (!resultFile) return null;
+    try {
+        if (!fs.existsSync(resultFile)) return null;
+        const parsed = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (error) {
+        console.error('[proxy-runner] 本次代理结果文件读取失败:', error.message);
+        return null;
+    } finally {
+        try { fs.unlinkSync(resultFile); } catch (error) { }
+    }
+}
+
+function actionStatusFromCode(code) {
+    switch (code) {
+        case EXIT_CODE.SUCCESS: return 'success';
+        case EXIT_CODE.NOT_READY: return 'not_ready';
+        case EXIT_CODE.ALREADY_RENEWED: return 'already_renewed';
+        case EXIT_CODE.LOGIN_FAILED: return 'login_failed';
+        case EXIT_CODE.RENEW_CAPTCHA_FAILED: return 'captcha_required';
+        case EXIT_CODE.PROXY_RETRY: return 'proxy_retry';
+        default: return 'error';
+    }
+}
+
+function makeAttemptRecord(attempt, parsed, childResult) {
+    const actionResult = childResult.actionResult || {};
+    const code = Number.isInteger(actionResult.exitCode) ? actionResult.exitCode : childResult.code;
+    return {
+        attempt,
+        proxy: parsed ? safeProxyId(parsed) : 'direct',
+        code,
+        status: actionResult.status || actionStatusFromCode(code),
+        message: actionResult.message || childResult.error?.message || (childResult.timedOut ? 'action_renew.js timed out' : ''),
+        screenshotPath: actionResult.screenshotPath || null,
+        htmlPath: actionResult.htmlPath || null,
+        accounts: Array.isArray(actionResult.accounts) ? actionResult.accounts : [],
+        timedOut: childResult.timedOut === true
+    };
+}
+
+function buildFinalSummary(finalCode, finalResult, attempts) {
+    const lastAttempt = attempts.length > 0 ? attempts[attempts.length - 1] : null;
+    const actionResult = finalResult || lastAttempt || {};
+    let status = actionResult.status || actionStatusFromCode(finalCode);
+    if (finalCode === EXIT_CODE.NO_PROXY_AVAILABLE) status = 'no_proxy_available';
+    if (finalCode === EXIT_CODE.FATAL && attempts.length > 0 && attempts.every(item => item.code === EXIT_CODE.PROXY_RETRY)) {
+        status = 'proxy_exhausted';
+    }
+
+    const accounts = Array.isArray(actionResult.accounts) ? actionResult.accounts : [];
+    const counts = {
+        success: accounts.filter(account => ['success', 'already_renewed'].includes(account.status)).length,
+        notReady: accounts.filter(account => account.status === 'not_ready').length,
+        failed: accounts.filter(account => !['success', 'not_ready', 'already_renewed'].includes(account.status)).length
+    };
+    if (counts.success === 0 && counts.notReady === 0 && counts.failed === 0 && accounts.length === 0) {
+        counts.failed = 0;
+    }
+
+    return {
+        exitCode: finalCode,
+        status,
+        message: actionResult.message || '',
+        screenshotPath: actionResult.screenshotPath || (lastAttempt && lastAttempt.screenshotPath) || null,
+        htmlPath: actionResult.htmlPath || (lastAttempt && lastAttempt.htmlPath) || null,
+        attempts,
+        accounts,
+        counts
+    };
+}
+
+function formatFinalNotification(summary) {
+    const titles = {
+        success: '✅ KataBump 自动续期完成',
+        not_ready: '⏳ KataBump 本轮暂不可续期',
+        already_renewed: 'ℹ️ KataBump 已续期或无需重复续期',
+        captcha_required: '⚠️ KataBump 续期验证码阻断',
+        login_failed: '❌ KataBump 登录失败',
+        no_proxy_available: '❌ KataBump 无可用代理',
+        proxy_exhausted: '❌ KataBump 代理已耗尽',
+        proxy_retry: '❌ KataBump 代理重试失败',
+        error: '❌ KataBump 自动续期失败'
+    };
+    const lines = [
+        titles[summary.status] || titles.error,
+        '',
+        `代理尝试：${summary.attempts.length}/${CONFIG.MAX_PROXY_SWITCHES}`
+    ];
+    if (summary.accounts.length > 0) {
+        lines.push(`账号总数：${summary.accounts.length}`);
+        lines.push(`成功：${summary.counts.success}`);
+        lines.push(`暂不可续期：${summary.counts.notReady}`);
+        lines.push(`失败：${summary.counts.failed}`);
+    }
+    lines.push(`最终状态：${summary.status}`);
+    if (summary.message) lines.push(`原因：${summary.message}`);
+    return lines.join('\n');
+}
+
+async function sendFinalTelegram(summary) {
+    const message = formatFinalNotification(summary);
+    console.log('[proxy-runner] 发送最终 Telegram 通知');
+    try {
+        const result = await sendTelegramNotification({
+            axios,
+            FormData,
+            fs,
+            token: TG_BOT_TOKEN,
+            chatId: TG_CHAT_ID,
+            message,
+            imagePath: summary.screenshotPath,
+            logger: console
+        });
+        if (result.skipped) console.log('[proxy-runner] Telegram 未配置，跳过最终通知');
+        return result;
+    } catch (error) {
+        console.error('[proxy-runner] 最终 Telegram 通知失败:', error.message);
+        return { skipped: false, textSent: false, imageSent: false };
+    }
+}
+
+async function finalizeWorkflow(finalCode, finalResult, attempts) {
+    const summary = buildFinalSummary(finalCode, finalResult, attempts);
+    await sendFinalTelegram(summary);
+    return finalCode;
+}
 
 // ============================================================
 //  冷却管理
@@ -318,11 +458,11 @@ function selectRandomProxy(proxies, cooldowns) {
 // ============================================================
 //  运行子进程
 // ============================================================
-function runActionRenew(parsed) {
+async function runActionRenew(parsed, attempt = 1) {
     const env = buildChildEnv(parsed, process.env);
     if (!env) {
         console.error('[proxy-runner] 当前代理格式无效，不静默直连');
-        return Promise.resolve({ code: EXIT_CODE.FATAL });
+        return { code: EXIT_CODE.FATAL, timedOut: false, actionResult: null };
     }
 
     if (parsed === null) {
@@ -335,29 +475,40 @@ function runActionRenew(parsed) {
     }
 
     const scriptPath = path.join(process.cwd(), 'action_renew.js');
+    const resultFile = createAttemptResultFile(attempt);
+    env.KATABUMP_MANAGED_BY_PROXY_RUNNER = '1';
+    env.KATABUMP_RESULT_FILE = resultFile;
     console.log(`[proxy-runner] 启动 action_renew.js，超时=${ACTION_TIMEOUT_MINUTES} 分钟，SIGTERM 宽限=${Math.round(DEFAULT_GRACEFUL_TERMINATION_MS / 1000)} 秒...`);
 
-    const proc = spawn('node', [scriptPath], {
-        env,
-        stdio: 'inherit',
-        shell: false,
-        detached: true
-    });
+    try {
+        const proc = spawn('node', [scriptPath], {
+            env,
+            stdio: 'inherit',
+            shell: false,
+            detached: true
+        });
 
-    return runChildWithTimeout(proc, {
-        timeoutMs: ACTION_TIMEOUT_MS,
-        gracefulMs: DEFAULT_GRACEFUL_TERMINATION_MS,
-        logger: console.error
-    }).then((result) => {
+        const result = await runChildWithTimeout(proc, {
+            timeoutMs: ACTION_TIMEOUT_MS,
+            gracefulMs: DEFAULT_GRACEFUL_TERMINATION_MS,
+            logger: console.error
+        });
         if (result.error) console.error('[proxy-runner] 启动或运行子进程失败:', result.error.message);
-        return { code: result.code, timedOut: result.timedOut };
-    });
+        return {
+            code: result.code,
+            timedOut: result.timedOut,
+            actionResult: readActionResult(resultFile)
+        };
+    } catch (error) {
+        try { fs.unlinkSync(resultFile); } catch (cleanupError) { }
+        return { code: EXIT_CODE.FATAL, timedOut: false, actionResult: null, error };
+    }
 }
 
 // ============================================================
 //  主流程
 // ============================================================
-async function main() {
+async function runProxyWorkflow(attempts) {
     console.log(`[proxy-runner] 启动代理轮换控制器`);
     console.log(`[proxy-runner] 最多尝试 ${CONFIG.MAX_PROXY_SWITCHES} 个代理，冷却 ${CONFIG.COOLDOWN_HOURS}h`);
     console.log(`[proxy-runner] 退出码映射: SUCCESS=0 FATAL=1 PROXY_RETRY=42 NOT_READY=3 ALREADY_RENEWED=4 LOGIN_FAILED=5 NO_PROXY_AVAILABLE=6 RENEW_CAPTCHA_FAILED=43`);
@@ -377,18 +528,28 @@ async function main() {
             selection = selectRandomProxy(proxies, cooldowns);
             if (!selection) {
                 console.log('[proxy-runner] 无可选代理（全部冷却中），本轮停止，不清空冷却名单');
-                return EXIT_CODE.NO_PROXY_AVAILABLE;
+                return finalizeWorkflow(EXIT_CODE.NO_PROXY_AVAILABLE, {
+                    status: 'no_proxy_available',
+                    message: 'No proxy is currently available',
+                    accounts: []
+                }, attempts);
             }
         } else if (proxyResult.configured) {
             console.log('[proxy-runner] proxies.txt 存在但无有效代理，禁止静默直连');
-            return EXIT_CODE.NO_PROXY_AVAILABLE;
+            return finalizeWorkflow(EXIT_CODE.NO_PROXY_AVAILABLE, {
+                status: 'no_proxy_available',
+                message: 'No valid proxy is configured',
+                accounts: []
+            }, attempts);
         } else {
             console.log('[proxy-runner] 未配置 proxies.txt，无代理直连');
         }
 
         // 2) 跑业务脚本；子进程由 action_renew.js 自己管理 BrowserContext/Browser 生命周期。
-        const result = await runActionRenew(selection || null);
+        const result = await runActionRenew(selection || null, attempt);
         const code = result.code;
+        const attemptRecord = makeAttemptRecord(attempt, selection, result);
+        attempts.push(attemptRecord);
 
         // 3) 按退出码决定
         if (NON_RETRYABLE.has(code)) {
@@ -398,7 +559,7 @@ async function main() {
                 console.log(`[proxy-runner] 业务状态码 ${code} 归一为 ${normalizedCode}（正常业务，非失败）`);
             }
             console.log(`[proxy-runner] 不可重试退出码 ${normalizedCode}，结束本轮`);
-            return normalizedCode;
+            return finalizeWorkflow(normalizedCode, result.actionResult || attemptRecord, attempts);
         }
 
         if (code === EXIT_CODE.PROXY_RETRY && selection) {
@@ -412,16 +573,34 @@ async function main() {
 
         if (code === EXIT_CODE.FATAL) {
             console.log(`[proxy-runner] 退出码 1 (FATAL)，非代理问题，停止`);
-            return EXIT_CODE.FATAL;
+            return finalizeWorkflow(EXIT_CODE.FATAL, result.actionResult || attemptRecord, attempts);
         }
 
         // 未知退出码也停止（不是 PROXY_RETRY）
         console.log(`[proxy-runner] 未知退出码 ${code}，不换代理，停止`);
-        return code;
+        return finalizeWorkflow(code, result.actionResult || attemptRecord, attempts);
     }
 
     console.log(`[proxy-runner] 已尝试 ${CONFIG.MAX_PROXY_SWITCHES} 个代理，均未成功`);
-    return EXIT_CODE.FATAL;
+    return finalizeWorkflow(EXIT_CODE.FATAL, attempts[attempts.length - 1] || {
+        status: 'proxy_exhausted',
+        message: 'All proxy attempts returned PROXY_RETRY',
+        accounts: []
+    }, attempts);
+}
+
+async function main() {
+    const attempts = [];
+    try {
+        return await runProxyWorkflow(attempts);
+    } catch (error) {
+        console.error('[proxy-runner] 主流程异常:', error.message);
+        return finalizeWorkflow(EXIT_CODE.FATAL, {
+            status: 'error',
+            message: error.message,
+            accounts: []
+        }, attempts);
+    }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename)) {
@@ -444,6 +623,10 @@ module.exports = {
     proxyKey,
     safeProxyId,
     runActionRenew,
+    readActionResult,
+    makeAttemptRecord,
+    buildFinalSummary,
+    formatFinalNotification,
     normalizeTimeoutMinutes,
     runChildWithTimeout,
     ACTION_TIMEOUT_MINUTES,

@@ -18,6 +18,9 @@ const {
 } = require('./lib/runtime_helpers');
 const { sendTelegramNotification } = require('./lib/telegram');
 
+const MANAGED_BY_PROXY_RUNNER = process.env.KATABUMP_MANAGED_BY_PROXY_RUNNER === '1';
+const RESULT_FILE = process.env.KATABUMP_RESULT_FILE || '';
+
 // --- 退出码（供外层 proxy_runner.js 使用） ---
 const EXIT_CODE = {
     SUCCESS: 0,
@@ -31,6 +34,8 @@ const EXIT_CODE = {
 
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
+let latestActionResult = null;
+let latestDebugSnapshot = { screenshotPath: null, htmlPath: null };
 
 // --- 辅助函数：发送 Telegram ---
 async function sendTelegramMessage(message, imagePath = null) {
@@ -44,6 +49,40 @@ async function sendTelegramMessage(message, imagePath = null) {
         imagePath,
         logger: console
     });
+}
+
+function setLatestActionResult({ exitCode, status, message = '', screenshotPath = null, htmlPath = null, accounts = [] }) {
+    latestActionResult = {
+        exitCode,
+        status,
+        message,
+        screenshotPath,
+        htmlPath,
+        accounts,
+        timestamp: new Date().toISOString()
+    };
+}
+
+function writeActionResult(exitCode) {
+    if (!RESULT_FILE) return;
+    const result = latestActionResult || {
+        exitCode,
+        status: exitCode === EXIT_CODE.PROXY_RETRY ? 'proxy_retry' : 'error',
+        message: 'action_renew.js finished without a structured result',
+        screenshotPath: null,
+        htmlPath: null,
+        accounts: [],
+        timestamp: new Date().toISOString()
+    };
+    result.exitCode = exitCode;
+    result.timestamp = new Date().toISOString();
+    try {
+        fs.mkdirSync(path.dirname(RESULT_FILE), { recursive: true });
+        fs.writeFileSync(RESULT_FILE, JSON.stringify(result, null, 2), 'utf-8');
+        console.log(`[结果] 本次代理尝试结果已写入: ${RESULT_FILE}`);
+    } catch (error) {
+        console.error('[结果] 结构化结果写入失败:', error.message);
+    }
 }
 
 chromium.use(stealth);
@@ -1141,13 +1180,18 @@ async function getLocatorText(locator) {
 /** 保存截图 + HTML 快照 */
 async function dumpDebugSnapshot(page, name) {
     const photoDir = await ensureScreenshotsDir();
+    const screenshotPath = path.join(photoDir, `${name}.png`);
+    const htmlPath = path.join(photoDir, `${name}.html`);
+    latestDebugSnapshot = { screenshotPath: null, htmlPath: null };
     try {
-        await page.screenshot({ path: path.join(photoDir, `${name}.png`), fullPage: true });
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        latestDebugSnapshot.screenshotPath = screenshotPath;
         console.log(`[Debug] 截图已保存: ${name}.png`);
     } catch (e) { }
     try {
         const html = await page.content();
-        fs.writeFileSync(path.join(photoDir, `${name}.html`), html, 'utf-8');
+        fs.writeFileSync(htmlPath, html, 'utf-8');
+        latestDebugSnapshot.htmlPath = htmlPath;
         console.log(`[Debug] HTML 已保存: ${name}.html`);
     } catch (e) { }
 }
@@ -1378,17 +1422,53 @@ function getUserExitCode(runStatus) {
     }
 }
 
+function selectDecisionAccount(accounts, exitCode) {
+    const statusByCode = {
+        [EXIT_CODE.SUCCESS]: 'success',
+        [EXIT_CODE.NOT_READY]: 'not_ready',
+        [EXIT_CODE.ALREADY_RENEWED]: 'already_renewed',
+        [EXIT_CODE.LOGIN_FAILED]: 'login_failed',
+        [EXIT_CODE.RENEW_CAPTCHA_FAILED]: 'captcha_required',
+        [EXIT_CODE.PROXY_RETRY]: 'login_captcha_required',
+        [EXIT_CODE.FATAL]: 'error'
+    };
+    const preferredStatus = statusByCode[exitCode];
+    if (preferredStatus) {
+        for (let i = accounts.length - 1; i >= 0; i--) {
+            if (accounts[i].status === preferredStatus) return accounts[i];
+        }
+    }
+    return accounts.length > 0 ? accounts[accounts.length - 1] : null;
+}
+
 async function handleAllInvalidUsers(users) {
     let overallExitCode = EXIT_CODE.SUCCESS;
+    const accounts = [];
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
         const accountLabel = safeAccountLabel(user, i);
         const displayAccount = user.username || accountLabel;
         const blockMessage = `Invalid account configuration: ${user.__invalidReason}`;
         console.error(`[配置] ${accountLabel} 标记为 login_failed：${user.__invalidReason}`);
-        await sendTelegramMessage(`❌ KataBump 登录失败\n用户: ${displayAccount}\n原因: ${blockMessage}`);
+        const notificationMessage = `❌ KataBump 登录失败\n用户: ${displayAccount}\n原因: ${blockMessage}`;
+        if (!MANAGED_BY_PROXY_RUNNER) {
+            await sendTelegramMessage(notificationMessage);
+        }
+        accounts.push({
+            account: displayAccount,
+            status: 'login_failed',
+            message: blockMessage,
+            screenshotPath: null,
+            htmlPath: null
+        });
         overallExitCode = mergeExitCode(overallExitCode, EXIT_CODE.LOGIN_FAILED);
     }
+    setLatestActionResult({
+        exitCode: overallExitCode,
+        status: 'login_failed',
+        message: 'All accounts have invalid configuration',
+        accounts
+    });
     return overallExitCode;
 }
 
@@ -1396,9 +1476,15 @@ async function handleAllInvalidUsers(users) {
 //  主流程
 // ============================================================
 async function runMain() {
+    latestActionResult = null;
     const usersConfig = validateUsersConfig(process.env.USERS_JSON);
     if (!usersConfig.valid) {
         console.error(`[配置] USERS_JSON 无效：${usersConfig.reason}`);
+        setLatestActionResult({
+            exitCode: EXIT_CODE.FATAL,
+            status: 'error',
+            message: `Invalid USERS_JSON: ${usersConfig.reason}`
+        });
         return EXIT_CODE.FATAL;
     }
     const users = usersConfig.users;
@@ -1407,7 +1493,14 @@ async function runMain() {
         return handleAllInvalidUsers(users);
     }
 
-    if (PROXY_CONFIG_ERROR) return EXIT_CODE.FATAL;
+    if (PROXY_CONFIG_ERROR) {
+        setLatestActionResult({
+            exitCode: EXIT_CODE.FATAL,
+            status: 'error',
+            message: 'Invalid proxy configuration'
+        });
+        return EXIT_CODE.FATAL;
+    }
 
     if (PROXY_CONFIG) {
         const checkResult = await checkProxy();
@@ -1418,12 +1511,22 @@ async function runMain() {
         ]);
         if (retryableProxyCategories.has(checkResult.category)) {
             console.error(`[代理] 连接失败，分类=${checkResult.category}，标记 PROXY_RETRY`);
+            setLatestActionResult({
+                exitCode: EXIT_CODE.PROXY_RETRY,
+                status: 'proxy_retry',
+                message: checkResult.error || checkResult.category
+            });
             return EXIT_CODE.PROXY_RETRY;
         }
         if (checkResult.category === 'target_server_error') {
             console.warn(`[代理] 目标服务器返回 HTTP ${checkResult.status}，分类=target_server_error，继续业务流程`);
         } else if (!checkResult.ok) {
             console.error(`[代理] 预检结果不可判定，分类=${checkResult.category}，停止本轮`);
+            setLatestActionResult({
+                exitCode: EXIT_CODE.FATAL,
+                status: 'error',
+                message: checkResult.error || checkResult.category
+            });
             return EXIT_CODE.FATAL;
         }
     }
@@ -1435,12 +1538,18 @@ async function runMain() {
         await ensureCdpAnchorPage(browser);
     } catch (error) {
         console.error('[主流程] Chrome/CDP 启动失败:', error.message);
+        setLatestActionResult({
+            exitCode: EXIT_CODE.FATAL,
+            status: 'error',
+            message: `Chrome/CDP startup failed: ${error.message}`
+        });
         return EXIT_CODE.FATAL;
     }
     let context = null;
     let page = null;
 
     let overallExitCode = EXIT_CODE.SUCCESS;
+    const accountResults = [];
     let shouldStopAllUsers = false;
     let stopCurrentUser = false;
 
@@ -1456,6 +1565,7 @@ async function runMain() {
         let blockMessage = '';
 
         let finalScreenshotPath = null;
+        latestDebugSnapshot = { screenshotPath: null, htmlPath: null };
 
         try {
             if (user.__invalidConfig) {
@@ -2141,8 +2251,18 @@ async function runMain() {
             notificationMessage = `❌ KataBump 错误\n用户: ${displayAccount}\n原因: ${blockMessage}`;
         }
         if (notificationMessage) {
-            await sendTelegramMessage(notificationMessage, finalScreenshotPath);
+            if (!MANAGED_BY_PROXY_RUNNER) {
+                await sendTelegramMessage(notificationMessage, finalScreenshotPath);
+            }
         }
+
+        accountResults.push({
+            account: displayAccount,
+            status: runStatus,
+            message: blockMessage,
+            screenshotPath: latestDebugSnapshot.screenshotPath || finalScreenshotPath,
+            htmlPath: latestDebugSnapshot.htmlPath
+        });
 
         // 账号级退出码归并
         const userExitCode = getUserExitCode(runStatus);
@@ -2161,6 +2281,16 @@ async function runMain() {
     }
 
     console.log('\n全部账号处理完成。');
+
+    const decisionAccount = selectDecisionAccount(accountResults, overallExitCode);
+    setLatestActionResult({
+        exitCode: overallExitCode,
+        status: decisionAccount ? decisionAccount.status : 'error',
+        message: decisionAccount ? decisionAccount.message : 'No account result was produced',
+        screenshotPath: decisionAccount ? decisionAccount.screenshotPath : null,
+        htmlPath: decisionAccount ? decisionAccount.htmlPath : null,
+        accounts: accountResults
+    });
 
     return overallExitCode;
 }
@@ -2266,8 +2396,14 @@ function installSignalHandlers() {
     } catch (error) {
         console.error('[主流程] 未处理异常:', error.message);
         finalExitCode = EXIT_CODE.FATAL;
+        setLatestActionResult({
+            exitCode: finalExitCode,
+            status: 'error',
+            message: error.message
+        });
     } finally {
         await closeRuntimeResources();
     }
+    writeActionResult(finalExitCode);
     process.exit(finalExitCode);
 })();

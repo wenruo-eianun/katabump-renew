@@ -169,6 +169,62 @@ function tests() {
         'host containing @ must not be reinterpreted as URL credentials'
     );
 
+    const retryAttempt = {
+        attempt: 1,
+        code: 42,
+        status: 'login_captcha_required',
+        message: 'Turnstile adapter error',
+        screenshotPath: 'screenshots/retry.png',
+        htmlPath: 'screenshots/retry.html',
+        accounts: [{ status: 'login_captcha_required' }]
+    };
+    const notReadyAttempt = {
+        attempt: 2,
+        code: 3,
+        status: 'not_ready',
+        message: "You can't renew your server yet",
+        screenshotPath: 'screenshots/not_ready_after_2.png',
+        htmlPath: 'screenshots/not_ready_after_2.html',
+        accounts: [{ status: 'not_ready' }]
+    };
+    const notReadySummary = mod.buildFinalSummary(0, notReadyAttempt, [retryAttempt, notReadyAttempt]);
+    assert.strictEqual(notReadySummary.status, 'not_ready');
+    assert.strictEqual(notReadySummary.screenshotPath, 'screenshots/not_ready_after_2.png');
+    assert.ok(mod.formatFinalNotification(notReadySummary).includes('最终状态：not_ready'));
+    assert.ok(!mod.formatFinalNotification(notReadySummary).includes('retry.png'));
+
+    const successAttempt = {
+        ...notReadyAttempt,
+        code: 0,
+        status: 'success',
+        screenshotPath: 'screenshots/success_after_2.png',
+        accounts: [{ status: 'success' }]
+    };
+    const successSummary = mod.buildFinalSummary(0, successAttempt, [retryAttempt, successAttempt]);
+    assert.strictEqual(successSummary.status, 'success');
+    assert.strictEqual(successSummary.screenshotPath, 'screenshots/success_after_2.png');
+
+    const exhaustedAttempts = [
+        retryAttempt,
+        { ...retryAttempt, attempt: 2, screenshotPath: 'screenshots/retry-2.png' },
+        { ...retryAttempt, attempt: 3, screenshotPath: 'screenshots/retry-3.png' },
+        { ...retryAttempt, attempt: 4, screenshotPath: 'screenshots/retry-4.png' },
+        { ...retryAttempt, attempt: 5, screenshotPath: 'screenshots/retry-5.png' }
+    ];
+    const exhaustedSummary = mod.buildFinalSummary(1, exhaustedAttempts[exhaustedAttempts.length - 1], exhaustedAttempts);
+    assert.strictEqual(exhaustedSummary.status, 'proxy_exhausted');
+    assert.strictEqual(exhaustedSummary.screenshotPath, 'screenshots/retry-5.png');
+
+    const fatalSummary = mod.buildFinalSummary(1, {
+        code: 1,
+        status: 'error',
+        message: 'fatal error',
+        screenshotPath: null,
+        accounts: []
+    }, []);
+    assert.strictEqual(fatalSummary.screenshotPath, null);
+    assert.ok(mod.formatFinalNotification(fatalSummary).includes('最终状态：error'));
+
     const localMaskOutput = [];
     mod.emitGithubMask('http://user:pass@host:8080', { GITHUB_ACTIONS: 'false' }, line => localMaskOutput.push(line));
     assert.deepStrictEqual(localMaskOutput, [], 'local runs must not print GitHub mask commands');
