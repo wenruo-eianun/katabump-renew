@@ -1721,10 +1721,17 @@ async function ensureScreenshotsDir() {
                                     renewSuccess = true;
                                     await page.screenshot({ path: path.join(await ensureScreenshotsDir(), `renew_success_${attempt}.png`), fullPage: true });
                                     break;
+                                } else if (newExpiryFinal && oldExpiry && newExpiryFinal === oldExpiry) {
+                                    console.log('   >> Modal 已关闭，Expiry 未变，可能已是最新的。');
+                                    runStatus = 'already_renewed';
+                                    renewSuccess = false;
+                                    break;
+                                } else {
+                                    console.log('   >> Modal 已关闭，但无法读取 Expiry，标记 unknown。');
+                                    renewSuccess = false;
+                                    runStatus = 'unknown';
+                                    break;
                                 }
-                                console.log('   >> Modal 已关闭，Expiry 未变，可能已是最新的。');
-                                runStatus = 'already_renewed';
-                                break;
                             }
                         }
                         // 二次 confirm 按钮不可见 → 重试
@@ -1925,6 +1932,8 @@ async function ensureScreenshotsDir() {
             await sendTelegramMessage(`❌ KataBump 登录失败\n用户: ${user.username}\n原因: ${blockMessage}`);
         } else if (runStatus === 'already_renewed') {
             await sendTelegramMessage(`ℹ️ KataBump 可能已续期\n用户: ${user.username}\nExpiry 未变化，可能本轮已是最新。`);
+        } else if (runStatus === 'error') {
+            await sendTelegramMessage(`❌ KataBump 错误\n用户: ${user.username}\n原因: ${blockMessage}`);
         }
 
         // 仅登录阶段 captcha_required 才触发代理轮换
@@ -1941,7 +1950,7 @@ async function ensureScreenshotsDir() {
             }
         }
         if (runStatus === 'error') { overallExitCode = EXIT_CODE.FATAL; shouldStopAllUsers = true; }
-        if (runStatus === 'login_failed') { overallExitCode = EXIT_CODE.LOGIN_FAILED; shouldStopAllUsers = true; }
+        if (runStatus === 'login_failed') { overallExitCode = EXIT_CODE.LOGIN_FAILED; }
         if (runStatus === 'success' && overallExitCode === EXIT_CODE.SUCCESS) overallExitCode = EXIT_CODE.SUCCESS;
         if (runStatus === 'not_ready' && overallExitCode === EXIT_CODE.SUCCESS) overallExitCode = EXIT_CODE.NOT_READY;
         if (runStatus === 'already_renewed' && overallExitCode === EXIT_CODE.SUCCESS) overallExitCode = EXIT_CODE.ALREADY_RENEWED;
