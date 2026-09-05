@@ -1983,14 +1983,38 @@ async function runMain() {
                     }
                 }
 
-                // 如果有 See 按钮，点击它；否则认为已在 dashboard 页面
-                try {
-                    const seeBtn = page.getByRole('link', { name: 'See' }).first();
-                    if (await seeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-                        await seeBtn.click();
-                        console.log('[登录] 已点击 See 按钮。');
+                // Dashboard 的服务器列表由 /api-client/list-servers 异步填充。
+                // 必须等待实际的服务器入口出现并点击 See，Renew 只存在于详情页。
+                if (!stopCurrentUser && !shouldStopAllUsers) {
+                    try {
+                        const seeBtn = page.locator('a[href*="/servers/edit?id="]').first();
+                        try {
+                            await seeBtn.waitFor({ state: 'visible', timeout: 20000 });
+                        } catch (firstError) {
+                            console.warn(`[登录] See 入口尚未出现，刷新 Dashboard 后重试: ${firstError.message}`);
+                            await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+                            await seeBtn.waitFor({ state: 'visible', timeout: 20000 });
+                        }
+
+                        const seeHref = await seeBtn.getAttribute('href');
+                        console.log(`[登录] 服务器入口已加载: ${seeHref || 'unknown'}`);
+                        await Promise.all([
+                            page.waitForURL(url => /\/servers\/edit\?id=/i.test(url), { timeout: 15000 }),
+                            seeBtn.click()
+                        ]);
+                        console.log(`[登录] 已点击 See 按钮，当前 URL: ${page.url()}`);
+
+                        const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
+                        await renewBtn.waitFor({ state: 'visible', timeout: 15000 });
+                        console.log('[登录] 已进入服务器详情页，Renew 按钮已出现。');
+                    } catch (e) {
+                        console.error(`[登录] See 或服务器详情页未就绪: ${e.message} (URL: ${page.url()})`);
+                        runStatus = 'error';
+                        blockMessage = `Server See entry or Renew button did not appear after login: ${e.message}`;
+                        await dumpDebugSnapshot(page, `server_entry_not_ready_${accountLabel}`);
+                        stopCurrentUser = true;
                     }
-                } catch (e) { }
+                }
             }
 
             // 3. Renew 主循环
